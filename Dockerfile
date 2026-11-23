@@ -9,6 +9,8 @@ RUN apt-get update && \
 WORKDIR /app
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY backend/ ./
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
 ENV STOCKFISH_PATH=/usr/games/stockfish
+WORKDIR /app/backend
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

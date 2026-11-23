@@ -1,5 +1,7 @@
+import os
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging
 
@@ -36,10 +38,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Chess Vision Coach API",
-    version="1.0.0",
+    version="2.0.0",
     description="Lightweight chess move suggester via camera + Stockfish.",
     lifespan=lifespan,
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,3 +59,16 @@ async def health(request: Request):
     if sf and sf.is_fallback:
         engine_name = "python-chess-fallback"
     return {"status": "ok", "engine": engine_name, "detector": "opencv"}
+
+# Serve frontend directly if present
+frontend_candidates = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend")),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "frontend")),
+    "/app/frontend",
+]
+
+for fdir in frontend_candidates:
+    if os.path.isdir(fdir) and os.path.isfile(os.path.join(fdir, "index.html")):
+        logger.info(f"Serving static frontend UI from: {fdir}")
+        app.mount("/", StaticFiles(directory=fdir, html=True), name="frontend")
+        break
