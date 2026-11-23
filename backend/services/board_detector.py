@@ -18,7 +18,7 @@ class BoardDetector:
         self._ready = True
         logger.info("BoardDetector ready (OpenCV).")
 
-    def detect(self, image_bytes: bytes) -> dict:
+    def detect(self, image_bytes: bytes, player_color: str = "w") -> dict:
         """
         Detect chess board from image bytes.
         Returns dict with: fen, turn, confidence, error, board_b64
@@ -49,7 +49,8 @@ class BoardDetector:
                 "Board confidence too low. Move camera closer or improve lighting.",
                 confidence=overall,
             )
-        fen, turn = self._matrix_to_fen(matrix, overall)
+
+        fen, turn = self._matrix_to_fen(matrix, overall, player_color=player_color)
         valid, fen = self._ensure_valid_fen(fen, turn)
 
         if not valid:
@@ -180,14 +181,11 @@ class BoardDetector:
 
         return matrix, round(float(np.mean(confs)), 3)
 
-    def _matrix_to_fen(self, matrix: list, confidence: float) -> tuple[str, str]:
+    def _matrix_to_fen(self, matrix: list, confidence: float, player_color: str = "w") -> tuple[str, str]:
         WHITE_BACK = list("RNBQKBNR")
         BLACK_BACK = list("rnbqkbnr")
 
         ranks = []
-        white_count = sum(row.count("W") for row in matrix)
-        black_count = sum(row.count("B") for row in matrix)
-
         for row_idx, row in enumerate(matrix):
             rank_str = ""
             empty_run = 0
@@ -202,11 +200,17 @@ class BoardDetector:
                 if cell == "B":
                     if row_idx == 0:
                         rank_str += BLACK_BACK[col_idx]
+                    elif row_idx == 7:
+                        # Pawns cannot exist on 1st rank
+                        rank_str += "q"
                     else:
                         rank_str += "p"
                 else:
                     if row_idx == 7:
                         rank_str += WHITE_BACK[col_idx]
+                    elif row_idx == 0:
+                        # Pawns cannot exist on 8th rank
+                        rank_str += "Q"
                     else:
                         rank_str += "P"
 
@@ -217,38 +221,99 @@ class BoardDetector:
             ranks.append(rank_str)
 
         board_str = "/".join(ranks)
-        turn = "b" if white_count < black_count else "w"
+        turn = player_color.lower() if player_color in ("w", "b") else "w"
         fen = f"{board_str} {turn} - - 0 1"
         return fen, turn
 
     def _ensure_valid_fen(self, fen: str, turn: str) -> tuple[bool, str]:
         try:
             board = chess.Board(fen)
-            if (len(board.pieces(chess.KING, chess.WHITE)) == 1 and
-                    len(board.pieces(chess.KING, chess.BLACK)) == 1):
+            if board.is_valid():
                 return True, fen
         except Exception:
             pass
+
         try:
             board = chess.Board(fen)
         except Exception:
             logger.warning("FEN completely invalid, using starting position.")
             return True, STARTING_FEN
-        if len(board.pieces(chess.KING, chess.WHITE)) == 0:
-            board.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
-        if len(board.pieces(chess.KING, chess.BLACK)) == 0:
-            board.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
+
+        # 1. Ensure exactly one White King
         white_kings = list(board.pieces(chess.KING, chess.WHITE))
-        while len(white_kings) > 1:
-            board.remove_piece_at(white_kings.pop())
+        if not white_kings:
+            # Place on e1 if empty, else find first empty square on rank 1
+            placed = False
+            for sq in [chess.E1, chess.F1, chess.D1, chess.G1, chess.C1]:
+                if board.piece_at(sq) is None:
+                    board.set_piece_at(sq, chess.Piece(chess.KING, chess.WHITE))
+                    placed = True
+                    break
+            if not placed:
+                board.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
+        elif len(white_kings) > 1:
+            while len(white_kings) > 1:
+                board.remove_piece_at(white_kings.pop())
+
+        # 2. Ensure exactly one Black King
         black_kings = list(board.pieces(chess.KING, chess.BLACK))
-        while len(black_kings) > 1:
-            board.remove_piece_at(black_kings.pop())
+        if not black_kings:
+            placed = False
+            for sq in [chess.E8, chess.F8, chess.D8, chess.G8, chess.C8]:
+                if board.piece_at(sq) is None:
+                    board.set_piece_at(sq, chess.Piece(chess.KING, chess.BLACK))
+                    placed = True
+                    break
+            if not placed:
+                board.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
+        elif len(black_kings) > 1:
+            while len(black_kings) > 1:
+                board.remove_piece_at(black_kings.pop())
+
+        # 3. Disallow pawns on back ranks (convert to Queens)
+        for sq in list(board.pieces(chess.PAWN, chess.WHITE)):
+            if chess.square_rank(sq) in (0, 7):
+                board.set_piece_at(sq, chess.Piece(chess.QUEEN, chess.WHITE))
+        for sq in list(board.pieces(chess.PAWN, chess.BLACK)):
+            if chess.square_rank(sq) in (0, 7):
+                board.set_piece_at(sq, chess.Piece(chess.QUEEN, chess.BLACK))
+
+        # 4. Ensure kings are not adjacent
+        w_king = board.king(chess.WHITE)
+        b_king = board.king(chess.BLACK)
+        if w_king is not None and b_king is not None:
+            if chess.square_distance(w_king, b_king) < 2:
+                for candidate in [chess.E8, chess.A8, chess.H8, chess.A7, chess.H7]:
+                    if candidate != w_king and chess.square_distance(w_king, candidate) >= 2:
+                        board.remove_piece_at(b_king)
+                        board.set_piece_at(candidate, chess.Piece(chess.KING, chess.BLACK))
+                        break
+
+        # 5. Handle illegal simultaneous opposite checks (detection noise artifact)
+        if board.status() & chess.STATUS_OPPOSITE_CHECK:
+            moving_color = chess.WHITE if turn == "w" else chess.BLACK
+            non_moving_color = chess.BLACK if turn == "w" else chess.WHITE
+            opp_king = board.king(non_moving_color)
+            if opp_king is not None:
+                attackers = list(board.attackers(moving_color, opp_king))
+                for att in attackers:
+                    if att != board.king(moving_color):
+                        board.remove_piece_at(att)
+                        break
 
         repaired_fen = f"{board.board_fen()} {turn} - - 0 1"
-        logger.info(f"FEN repaired: {repaired_fen}")
         try:
-            chess.Board(repaired_fen)
+            test_board = chess.Board(repaired_fen)
+            if test_board.is_valid():
+                return True, repaired_fen
+
+            # If opposite king is in check, switch turn to escape check
+            if test_board.status() & chess.STATUS_OPPOSITE_CHECK:
+                opp_turn = "b" if turn == "w" else "w"
+                repaired_fen = f"{board.board_fen()} {opp_turn} - - 0 1"
+                if chess.Board(repaired_fen).is_valid():
+                    return True, repaired_fen
+
             return True, repaired_fen
         except Exception:
             logger.warning("FEN repair failed, using starting position.")
