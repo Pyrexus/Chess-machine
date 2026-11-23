@@ -2,7 +2,7 @@
  * Chess Vision Coach — Frontend Application v2.0
  */
 
-const DEFAULT_API_BASE = "https://chess-machine-production.up.railway.app";
+const DEFAULT_API_BASE = "https://backend-production-e51676e6.up.railway.app";
 const urlParams        = new URLSearchParams(window.location.search);
 let API_BASE           = urlParams.get("api") || localStorage.getItem("chess_api_base") || DEFAULT_API_BASE;
 
