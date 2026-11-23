@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
@@ -14,15 +14,25 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Starting Chess Vision Coach backend...")
     app.state.stockfish = StockfishService()
-    app.state.stockfish.start()
-    logger.info("Stockfish engine started.")
+    try:
+        app.state.stockfish.start()
+        logger.info(f"Chess engine started (fallback={app.state.stockfish.is_fallback}).")
+    except Exception as e:
+        logger.warning(f"Error during Stockfish start: {e}. Fallback active.")
+
     app.state.detector = BoardDetector()
-    app.state.detector.load()
-    logger.info("Board detector loaded.")
+    try:
+        app.state.detector.load()
+        logger.info("Board detector loaded.")
+    except Exception as e:
+        logger.error(f"Error loading BoardDetector: {e}")
 
     yield
-    app.state.stockfish.stop()
-    logger.info("Stockfish engine stopped.")
+    try:
+        app.state.stockfish.stop()
+    except Exception:
+        pass
+    logger.info("Chess engine stopped.")
 
 app = FastAPI(
     title="Chess Vision Coach API",
@@ -33,12 +43,16 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 app.include_router(analysis.router, prefix="/api")
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "engine": "stockfish", "detector": "opencv"}
+async def health(request: Request):
+    sf = getattr(request.app.state, "stockfish", None)
+    engine_name = "stockfish"
+    if sf and sf.is_fallback:
+        engine_name = "python-chess-fallback"
+    return {"status": "ok", "engine": engine_name, "detector": "opencv"}
