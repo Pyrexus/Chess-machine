@@ -3,8 +3,9 @@ import shutil
 import threading
 import logging
 import random
+import time
 import chess
-from stockfish import Stockfish
+import chess.engine
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +101,16 @@ def validate_fen(fen: str) -> tuple[bool, str]:
             if chess.square_rank(sq) in (0, 7):
                 return False, "Black pawn detected on first or eighth rank."
 
-        # Ensure board status is valid enough for search
+        # Validate the complete chess state before either engine searches it.
         status = board.status()
         if status & chess.STATUS_OPPOSITE_CHECK:
-            return False, "Opposite king is in check — impossible position."
+            return False, "The side that just moved is still in check. Check the side to move and the piece placement."
+        if status & chess.STATUS_BAD_CASTLING_RIGHTS:
+            return False, "Castling rights do not match the king and rook positions."
+        if status & chess.STATUS_INVALID_EP_SQUARE:
+            return False, "The en passant square does not match this position."
+        if not board.is_valid():
+            return False, "This position is not legal. Check the kings, piece counts and side to move."
 
         return True, ""
     except Exception as e:
@@ -124,9 +131,9 @@ def _evaluate_board(board: chess.Board) -> int:
 
         # Piece-square bonuses
         if piece.piece_type == chess.PAWN:
-            pos_bonus = PAWN_TABLE[sq if piece.color == chess.WHITE else chess.square_mirror(sq)]
+            pos_bonus = PAWN_TABLE[chess.square_mirror(sq) if piece.color == chess.WHITE else sq]
         elif piece.piece_type == chess.KNIGHT:
-            pos_bonus = KNIGHT_TABLE[sq if piece.color == chess.WHITE else chess.square_mirror(sq)]
+            pos_bonus = KNIGHT_TABLE[chess.square_mirror(sq) if piece.color == chess.WHITE else sq]
         else:
             r, c = chess.square_rank(sq), chess.square_file(sq)
             pos_bonus = int((3 - abs(3.5 - r) + (3 - abs(3.5 - c))) * 4)
@@ -137,8 +144,14 @@ def _evaluate_board(board: chess.Board) -> int:
     return score
 
 
-def _alpha_beta_search(board: chess.Board, depth: int, alpha: int, beta: int, maximizing: bool):
+class SearchTimeout(Exception):
+    pass
+
+
+def _alpha_beta_search(board: chess.Board, depth: int, alpha: int, beta: int, maximizing: bool, deadline: float | None = None):
     """Minimax search with alpha-beta pruning for fallback engine."""
+    if deadline is not None and time.monotonic() >= deadline:
+        raise SearchTimeout()
     if depth <= 0 or board.is_game_over():
         return _evaluate_board(board), None
 
@@ -154,8 +167,10 @@ def _alpha_beta_search(board: chess.Board, depth: int, alpha: int, beta: int, ma
         max_eval = -999999
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = _alpha_beta_search(board, depth - 1, alpha, beta, False)
-            board.pop()
+            try:
+                eval_score, _ = _alpha_beta_search(board, depth - 1, alpha, beta, False, deadline)
+            finally:
+                board.pop()
             if eval_score > max_eval:
                 max_eval = eval_score
                 best_move = move
@@ -167,8 +182,10 @@ def _alpha_beta_search(board: chess.Board, depth: int, alpha: int, beta: int, ma
         min_eval = 999999
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = _alpha_beta_search(board, depth - 1, alpha, beta, True)
-            board.pop()
+            try:
+                eval_score, _ = _alpha_beta_search(board, depth - 1, alpha, beta, True, deadline)
+            finally:
+                board.pop()
             if eval_score < min_eval:
                 min_eval = eval_score
                 best_move = move
@@ -192,16 +209,27 @@ class PythonFallbackEngine:
         if not legal_moves:
             return None
 
-        # Search depth: clamped to 2-3 for sub-100ms response time
+        # Finish shallower iterations before deepening so every request has a
+        # legal answer within a bounded CPU budget, including crowded boards.
         search_depth = 3 if depth >= 8 else 2
+        deadline = time.monotonic() + 0.3
         maximizing = (board.turn == chess.WHITE)
-
         scored_moves = []
-        for move in legal_moves:
-            board.push(move)
-            score, _ = _alpha_beta_search(board, search_depth - 1, -1000000, 1000000, not maximizing)
-            board.pop()
-            scored_moves.append((score, move))
+        for current_depth in range(1, search_depth + 1):
+            iteration = []
+            try:
+                for move in legal_moves:
+                    board.push(move)
+                    try:
+                        score, _ = _alpha_beta_search(board, current_depth - 1, -1000000, 1000000, not maximizing,
+                                                     deadline if current_depth > 1 else None)
+                    finally:
+                        board.pop()
+                    iteration.append((score, move))
+            except SearchTimeout:
+                break
+            scored_moves = iteration
+            legal_moves = [move for _, move in sorted(scored_moves, key=lambda item: item[0], reverse=maximizing)]
 
         # Sort moves best to worst for current player
         scored_moves.sort(key=lambda x: x[0], reverse=maximizing)
@@ -219,7 +247,7 @@ class PythonFallbackEngine:
 
 class StockfishService:
     def __init__(self):
-        self._engine: Stockfish | None = None
+        self._engine: chess.engine.SimpleEngine | None = None
         self._path: str | None = None
         self._lock = threading.Lock()
         self._fallback_engine = PythonFallbackEngine()
@@ -249,16 +277,12 @@ class StockfishService:
 
     def _spawn(self):
         try:
-            self._engine = Stockfish(
-                path=self._path,
-                depth=10,
-                parameters={
-                    "Threads": 1,
-                    "Hash": 32,
-                },
-            )
+            self._engine = chess.engine.SimpleEngine.popen_uci(self._path, timeout=3.0)
+            self._engine.configure({"Threads": 1, "Hash": 32})
             logger.info("Stockfish engine process spawned successfully.")
         except Exception as e:
+            if self._engine:
+                self._engine.close()
             self._engine = None
             logger.error(f"Stockfish spawn failed: {e}")
             raise
@@ -267,10 +291,11 @@ class StockfishService:
         with self._lock:
             if self._engine:
                 try:
-                    del self._engine
+                    self._engine.quit()
                 except Exception:
                     pass
                 self._engine = None
+            self._is_fallback = False
             logger.info("Stockfish service stopped.")
 
     def get_best_move(self, fen: str, depth: int = 10, mode: str = "win") -> dict:
@@ -280,20 +305,27 @@ class StockfishService:
                 raise ValueError(err)
 
             depth = max(4, min(16, depth))
+            board = chess.Board(fen)
+            if board.is_game_over():
+                return {"uci": None, "san": None, "human": "No legal moves.", "elo": 0,
+                        "engine": "python-chess-fallback" if self._is_fallback else "stockfish"}
             uci = None
+            used_fallback = False
 
             # Attempt 1: Use Stockfish if available
             if not self._is_fallback and self._engine is not None:
                 try:
                     effective_depth = depth if mode == "win" else max(4, depth - 3)
-                    self._engine.set_depth(effective_depth)
-                    self._engine.set_fen_position(fen)
-                    uci = self._engine.get_best_move()
+                    limit = chess.engine.Limit(depth=effective_depth, time=0.35)
+                    result = self._engine.play(board, limit)
+                    uci = result.move.uci() if result.move else None
 
                     if mode == "loss" and uci:
-                        uci = self._weaken_stockfish(uci)
+                        uci = self._weaken_stockfish(uci, board)
                 except Exception as e:
                     logger.warning(f"Stockfish engine execution failed ({e}), using fallback.")
+                    if self._engine:
+                        self._engine.close()
                     self._engine = None
                     try:
                         self._spawn()
@@ -302,28 +334,34 @@ class StockfishService:
 
             # Attempt 2: Use fallback engine if Stockfish is unavailable or failed
             if not uci:
+                used_fallback = True
                 uci = self._fallback_engine.get_best_move(fen, depth=depth, mode=mode)
 
             if not uci:
                 return {"uci": None, "san": None, "human": "No legal moves.", "elo": 0}
 
+            if chess.Move.from_uci(uci) not in board.legal_moves:
+                raise RuntimeError("Chess engine returned an illegal move.")
             san, human = self._to_human(fen, uci)
             return {
                 "uci": uci,
                 "san": san,
                 "human": human,
-                "elo": DEPTH_ELO_MAP.get(depth, 1900),
+                "elo": None if used_fallback else DEPTH_ELO_MAP.get(depth, 1900),
+                "engine": "python-chess-fallback" if used_fallback else "stockfish",
             }
 
-    def _weaken_stockfish(self, best_uci: str) -> str:
+    def _weaken_stockfish(self, best_uci: str, board: chess.Board) -> str:
         if random.random() > 0.40:
             return best_uci
         try:
-            top = self._engine.get_top_moves(3)
+            top = self._engine.analyse(board, chess.engine.Limit(time=0.15), multipv=3)
             if len(top) >= 2:
-                cp_loss = abs((top[0].get("Centipawn") or 0) - (top[1].get("Centipawn") or 0))
+                first = top[0]["score"].pov(board.turn).score(mate_score=100000)
+                second = top[1]["score"].pov(board.turn).score(mate_score=100000)
+                cp_loss = abs(first - second)
                 if cp_loss < 250:
-                    return top[1]["Move"]
+                    return top[1]["pv"][0].uci()
         except Exception:
             pass
         return best_uci
@@ -352,7 +390,7 @@ class StockfishService:
             elif board.is_capture(move):
                 human = f"Capture on {to} with {pname}"
             else:
-                human = f"Move {pname} to {to}"
+                human = f"{pname} to {to}"
 
             if "#" in san:
                 human += " (Checkmate!)"

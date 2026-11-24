@@ -1,5 +1,6 @@
 import pytest
 import chess
+import time
 from services.stockfish_service import (
     StockfishService,
     validate_fen,
@@ -60,7 +61,7 @@ def test_get_best_move_win_and_loss_modes():
     assert res_win["uci"] is not None
     assert res_win["san"] is not None
     assert res_win["human"] is not None
-    assert res_win["elo"] == 1900
+    assert res_win["elo"] == (None if res_win["engine"] == "python-chess-fallback" else 1900)
 
     board = chess.Board(start_fen)
     assert chess.Move.from_uci(res_win["uci"]) in board.legal_moves
@@ -77,12 +78,12 @@ def test_to_human_descriptions():
     # Pawn push
     san, human = sf._to_human(start_fen, "e2e4")
     assert san == "e4"
-    assert human == "Move Pawn to e4"
+    assert human == "Pawn to e4"
 
     # Knight move
     san, human = sf._to_human(start_fen, "g1f3")
     assert san == "Nf3"
-    assert human == "Move Knight to f3"
+    assert human == "Knight to f3"
 
     # Capture
     capture_fen = "r1bqkbnr/ppp1pppp/2n5/3p4/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3"
@@ -96,3 +97,50 @@ def test_to_human_descriptions():
     res = sf.get_best_move(check_fen)
     assert res["uci"] is None
     assert res["human"] == "No legal moves."
+
+
+@pytest.mark.parametrize("fen", [
+    "8/8/8/8/8/8/4k3/4K3 w - - 0 1",  # Adjacent kings.
+    "4k3/8/8/8/8/8/8/4K3 w KQ - 0 1",  # Castling without rooks.
+    "4k3/8/8/8/8/8/8/4K3 w - e3 0 1",  # Impossible en passant.
+    "4k3/8/8/8/8/8/PPPPPPPP/P3K3 w - - 0 1",  # Back-rank pawn.
+    "4k3/8/8/8/8/8/8/4K2R w - - 0 1".replace("4k3", "7k"),  # Non-moving king in check.
+])
+def test_complete_fen_legality(fen):
+    valid, message = validate_fen(fen)
+    assert not valid
+    assert message
+
+
+def test_correct_side_to_move_allows_check_evasion():
+    checked = "7k/8/6K1/8/8/8/8/7R b - - 0 1"
+    assert validate_fen(checked)[0]
+    assert not validate_fen(checked.replace(" b ", " w "))[0]
+    sf = StockfishService()
+    sf.start()
+    try:
+        result = sf.get_best_move(checked)
+        assert chess.Move.from_uci(result["uci"]) in chess.Board(checked).legal_moves
+    finally:
+        sf.stop()
+
+
+def test_fallback_is_bounded_and_reports_actual_engine():
+    sf = StockfishService()
+    sf._is_fallback = True
+    started = time.monotonic()
+    result = sf.get_best_move(chess.STARTING_FEN, depth=16)
+    assert time.monotonic() - started < 2.0
+    assert result["engine"] == "python-chess-fallback"
+    assert result["elo"] is None
+    assert chess.Move.from_uci(result["uci"]) in chess.Board().legal_moves
+
+
+def test_human_text_castling_promotion_and_en_passant():
+    sf = StockfishService()
+    _, castle = sf._to_human("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1")
+    assert castle == "Castle Kingside"
+    _, promotion = sf._to_human("7k/P7/8/8/8/8/8/4K3 w - - 0 1", "a7a8q")
+    assert "Promote Pawn to Queen on a8" in promotion
+    _, capture = sf._to_human("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6")
+    assert capture == "Capture on d6 with Pawn"

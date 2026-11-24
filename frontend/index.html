@@ -2,246 +2,94 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="color-scheme" content="light dark" />
-  <meta name="description" content="AI-assisted real-time chess vision coach and move suggester powered by Stockfish and OpenCV." />
-  <title>Chess Vision Coach • AI Move Suggester</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="light" />
+  <meta name="theme-color" content="#f4f5f0" />
+  <meta name="description" content="A camera chess coach. Follow the next move directly on your board, with clear suggestions in plain language." />
+  <title>Chess Vision — Your next move, in focus</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <!-- ══════════════════════════════════════════════
-       HEADER
-  ══════════════════════════════════════════════ -->
-  <header class="header">
-    <div class="header-inner">
-      <div class="logo">
-        <span class="logo-icon" aria-hidden="true">♟</span>
-        <div class="logo-titles">
-          <span class="logo-text">Chess Vision Coach</span>
-          <span class="logo-badge">v2.0 • AI Engine</span>
-        </div>
-      </div>
-      <div class="header-actions">
-        <button class="status-pill connecting" id="engineStatus" title="Click to configure backend API" aria-label="Engine status">
-          <span class="status-dot"></span>
-          <span class="status-label">Connecting…</span>
-        </button>
-      </div>
-    </div>
-  </header>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M8 6l1.5-3h5L16 6h4a2 2 0 012 2v11a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"/><circle cx="12" cy="13" r="4"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5l5-5 5 5M4 15v5a1 1 0 001 1h14a1 1 0 001-1v-5"/></symbol>
+    <symbol id="i-flip" viewBox="0 0 24 24"><path d="M4 8a8 8 0 0113.5-3L21 8M21 3v5h-5M20 16a8 8 0 01-13.5 3L3 16m0 5v-5h5"/></symbol>
+    <symbol id="i-scan" viewBox="0 0 24 24"><path d="M8 3H4a1 1 0 00-1 1v4m13-5h4a1 1 0 011 1v4M3 16v4a1 1 0 001 1h4m8 0h4a1 1 0 001-1v-4M7 12h10"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6l6 6-6 6"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 017.5-2M12 15v2"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></symbol>
+    <symbol id="i-knight" viewBox="0 0 24 24"><path d="M6 21h13M8 18h10c0-6-3-8-6-9l3-1-1-4-3 1-2-2v5l-4 5 3 2 3-2"/><circle cx="11.5" cy="8" r=".6" fill="currentColor" stroke="none"/></symbol>
+  </svg>
 
-  <!-- ══════════════════════════════════════════════
-       MAIN LAYOUT
-  ══════════════════════════════════════════════ -->
+  <header class="header"><div class="header-inner">
+    <a class="brand" href="./" aria-label="Chess Vision home"><span class="brand-mark"><svg class="icon"><use href="#i-knight" /></svg></span><span>Chess<span class="brand-light">Vision</span><small>THE CAMERA CHESS COACH</small></span></a>
+    <button type="button" class="status-pill connecting" id="engineStatus" aria-label="Configure engine connection" title="Engine connection settings"><span class="status-dot"></span><span class="status-label">Connecting</span></button>
+  </div></header>
+
   <main class="main">
-
-    <!-- LEFT COLUMN: Camera, Upload & Visual Preview -->
-    <section class="col col-camera" aria-label="Board input and detection">
-
-      <!-- Input Mode Switcher -->
-      <div class="card mode-tabs-card">
-        <div class="tab-group" role="tablist" aria-label="Input mode">
-          <button class="tab-btn active" id="tabCamera" role="tab" aria-selected="true" data-tab="camera">
-            <span class="tab-icon">📷</span> Live Camera
-          </button>
-          <button class="tab-btn" id="tabUpload" role="tab" aria-selected="false" data-tab="upload">
-            <span class="tab-icon">📁</span> Upload Photo
-          </button>
-          <button class="tab-btn" id="tabPresets" role="tab" aria-selected="false" data-tab="presets">
-            <span class="tab-icon">⚡</span> Quick Test
-          </button>
-        </div>
-      </div>
-
-      <!-- Live Camera View -->
-      <div class="card camera-card" id="cameraContainer">
-        <div class="card-label">
-          <span>Camera Feed</span>
-          <span class="live-indicator" id="liveIndicator" style="display:none">● LIVE</span>
-        </div>
-        <div class="camera-wrapper">
-          <video id="cameraFeed" autoplay playsinline muted aria-label="Live camera feed"></video>
+    <div class="page-intro"><div><p class="eyebrow">A LITTLE CLARITY. A BETTER MOVE.</p><h1>Your next move, <span>in focus.</span></h1></div><p class="intro-description">Point your camera at the board.<br />Follow the move, right where you play.</p></div>
+    <div class="workspace">
+      <section class="camera-panel" aria-labelledby="cameraTitle">
+        <div class="panel-heading"><h2 id="cameraTitle"><svg class="icon"><use href="#i-camera" /></svg> Your board</h2><span class="frame-ratio">1:1 CAMERA VIEW</span></div>
+        <div class="camera-frame" id="cameraFrame">
+          <video id="cameraFeed" autoplay playsinline muted hidden aria-label="Live chessboard camera"></video>
+          <img id="photoPreview" hidden alt="Uploaded chessboard" />
           <canvas id="captureCanvas" hidden></canvas>
+          <svg id="moveOverlay" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" preserveAspectRatio="none" role="img" aria-label="Detected board and suggested move"></svg>
+          <div id="frameMoveLabel" class="frame-move-label" hidden aria-hidden="true"></div>
           <div class="camera-overlay" id="cameraOverlay">
-            <span class="overlay-icon">📷</span>
-            <span class="overlay-title">Point camera overhead at your physical board</span>
-            <span class="overlay-sub">Click "Start Analysis" below or switch to "Quick Test" to try without camera</span>
+            <div class="empty-board" aria-hidden="true"><svg class="empty-knight"><use href="#i-knight" /></svg><i class="view-corner tl"></i><i class="view-corner tr"></i><i class="view-corner bl"></i><i class="view-corner br"></i></div>
+            <h3>Your board, in focus</h3><p>Keep the full board in view.<br />We’ll lock it and find your next move.</p><span class="camera-empty-note">START WITH THE PIECES IN THEIR STARTING POSITION</span>
           </div>
+          <div class="frame-hud"><span class="frame-tag" id="boardStatus"><span class="hud-dot"></span> Camera off</span><span class="frame-tag live-indicator" id="liveIndicator" hidden><span class="hud-dot"></span> LIVE</span><span class="frame-tag confidence" id="confBadge" hidden></span></div>
         </div>
-      </div>
-
-      <!-- File Upload View -->
-      <div class="card upload-card" id="uploadContainer" style="display: none;">
-        <div class="card-label">Upload Board Snapshot</div>
-        <div class="upload-dropzone" id="dropZone">
-          <input type="file" id="fileInput" accept="image/*" class="visually-hidden" aria-label="Upload chessboard image" />
-          <span class="upload-icon">📤</span>
-          <span class="upload-text">Drag & drop a chessboard photo here, or <label for="fileInput" class="upload-link">browse files</label></span>
-          <span class="upload-hint">PNG, JPEG, WebP up to 10MB</span>
+        <div class="camera-actions">
+          <button type="button" class="btn btn-primary" id="btnStart"><svg class="icon"><use href="#i-camera" /></svg> Start camera</button>
+          <button type="button" class="btn btn-secondary" id="btnStop" disabled><svg class="icon"><use href="#i-stop" /></svg> Stop</button>
+          <button type="button" class="btn btn-icon" id="btnSwitchCamera" disabled aria-label="Switch front and rear camera" title="Switch camera"><svg class="icon"><use href="#i-flip" /></svg></button>
         </div>
-      </div>
+        <div class="camera-secondary-actions"><input type="file" id="fileInput" accept="image/*" class="visually-hidden" aria-label="Choose a chessboard photo" /><button type="button" class="text-btn" id="btnUploadPhoto"><svg class="icon"><use href="#i-upload" /></svg> Upload a photo</button><button type="button" class="text-btn" id="btnDemo"><svg class="icon"><use href="#i-spark" /></svg> Try a demo</button></div>
+        <div class="board-tools"><span>Board alignment</span><div><button type="button" class="text-btn" id="btnLockBoard" disabled><svg class="icon"><use href="#i-scan" /></svg> Set corners</button><button type="button" class="text-btn" id="btnUnlockBoard" disabled><svg class="icon"><use href="#i-unlock" /></svg> Unlock</button></div></div>
+        <p class="camera-tip">An overhead view works best. Keep hands clear while the board is being read.</p>
+      </section>
 
-      <!-- Quick Test / FEN Presets View -->
-      <div class="card presets-card" id="presetsContainer" style="display: none;">
-        <div class="card-label">Test Positions & FEN Input</div>
-        <p class="presets-intro">Instantly test move suggestions without needing a camera:</p>
-        <div class="preset-buttons">
-          <button class="preset-chip active" data-fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" data-color="w">Starting Position</button>
-          <button class="preset-chip" data-fen="r1bqkb1r/pppp1ppp/2n5/4p3/2B1n3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 5" data-color="w">Italian Game Fork</button>
-          <button class="preset-chip" data-fen="r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4" data-color="w">Scholar's Mate Threat</button>
-          <button class="preset-chip" data-fen="8/8/5k2/8/8/4KN2/8/8 w - - 0 1" data-color="w">Endgame Knight</button>
-        </div>
-        <div class="custom-fen-row">
-          <input type="text" id="customFenInput" class="custom-fen-input" placeholder="Paste custom FEN string here…" value="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" />
-          <button class="btn btn-secondary" id="btnAnalyzeFen">Analyze FEN</button>
-        </div>
-      </div>
-
-      <!-- Detected Board Preview with Move Overlay -->
-      <div class="card board-card" id="boardCard" style="display:none">
-        <div class="card-label">
-          <span>Detected Board & Move Arrow</span>
-          <span class="conf-badge" id="confBadge">–</span>
-        </div>
-        <div class="board-wrapper">
-          <img id="boardImg" src="" alt="Detected chess board with recommended move vector" />
-        </div>
-      </div>
-
-    </section>
-
-    <!-- RIGHT COLUMN: Setup, Engine Controls & Move Output -->
-    <section class="col col-controls" aria-label="Engine controls and suggestions">
-
-      <!-- Setup Card -->
-      <div class="card config-card">
-        <div class="card-label">Player Setup</div>
-
-        <!-- Player Colour -->
-        <div class="control-group">
-          <label class="ctrl-label" id="colorLabel">I'm playing as</label>
-          <div class="toggle-group" id="colorToggle" role="group" aria-labelledby="colorLabel">
-            <button class="toggle-btn active" data-val="w" aria-pressed="true">
-              <span class="piece-icon">♔</span> White
-            </button>
-            <button class="toggle-btn" data-val="b" aria-pressed="false">
-              <span class="piece-icon">♚</span> Black
-            </button>
+      <aside class="coach-panel" aria-label="Move suggestion and board settings">
+        <section class="move-card card" id="moveCard" aria-labelledby="moveTitle">
+          <div class="card-heading"><h2 id="moveTitle"><svg class="icon"><use href="#i-spark" /></svg> Your next move</h2><span class="engine-badge" id="engineBadge">Chess engine</span></div>
+          <div class="move-display" aria-live="polite" aria-atomic="true">
+            <div class="move-waiting" id="moveWaiting"><div class="waiting-arrow" aria-hidden="true"><svg class="icon"><use href="#i-arrow" /></svg></div><h3>Good moves start here.</h3><p id="waitText">Start your camera or upload a board photo to get a suggestion.</p></div>
+            <div class="move-result" id="moveResult" hidden><p class="move-overline">RECOMMENDED MOVE</p><h3 class="move-text" id="moveText">Pawn to d4</h3><div class="move-notation"><span class="move-san" id="moveSan">d4</span><span class="move-uci" id="moveUci">d2 → d4</span></div><p class="move-caption">Follow the arrow on your board.</p></div>
           </div>
-        </div>
+          <div class="recent-moves" id="recentContainer" hidden><span>Recent suggestions</span><div id="recentPills"></div></div>
+          <div class="status-bar" id="statusBar" role="status"><span class="status-indicator-dot"></span><span id="statusMsg">Ready when you are.</span></div>
+        </section>
 
-        <!-- Win / Loss Mode -->
-        <div class="control-group">
-          <label class="ctrl-label" id="modeLabel">Engine Strategy</label>
-          <div class="toggle-group" id="modeToggle" role="group" aria-labelledby="modeLabel">
-            <button class="toggle-btn active" data-val="win" aria-pressed="true">
-              🏆 Win Mode
-            </button>
-            <button class="toggle-btn" data-val="loss" aria-pressed="false">
-              🎭 Loss Mode
-            </button>
-          </div>
-        </div>
-
-        <!-- Depth Slider -->
-        <div class="control-group">
-          <div class="ctrl-label">
-            <label for="depthSlider">Calculation Depth</label>
-            <span class="elo-hint" id="eloHint">≈ 1900 Elo*</span>
-          </div>
-          <div class="depth-row">
-            <input type="range" id="depthSlider" min="4" max="16" value="10" step="1" aria-valuemin="4" aria-valuemax="16" aria-valuenow="10" />
-            <span class="depth-val" id="depthVal">10</span>
-          </div>
-          <p class="elo-note">* Approximate Elo estimate for practical human play</p>
-        </div>
-
-        <!-- Action Buttons -->
-        <div class="btn-row">
-          <button class="btn btn-start" id="btnStart">▶ Start Analysis</button>
-          <button class="btn btn-stop" id="btnStop" disabled>■ Stop</button>
-        </div>
-      </div>
-
-      <!-- Recommended Move Output Card -->
-      <div class="card move-card" id="moveCard">
-        <div class="card-label">
-          <span>Recommended Move</span>
-          <span class="engine-badge" id="engineBadge">Stockfish 16</span>
-        </div>
-
-        <!-- Big Move Display -->
-        <div class="move-display" id="moveDisplay">
-          <div class="move-waiting" id="moveWaiting">
-            <span class="wait-icon">⏳</span>
-            <span id="waitText">Ready. Press "Start Analysis" or choose a Quick Test position.</span>
-          </div>
-          <div class="move-result" id="moveResult" style="display:none">
-            <div class="move-header">
-              <span class="move-san" id="moveSan">e4</span>
-              <span class="move-uci-badge" id="moveUci">e2 → e4</span>
+        <section class="settings-card card" aria-labelledby="settingsTitle">
+          <div class="card-heading"><h2 id="settingsTitle">At the board</h2><span class="section-number">01</span></div>
+          <div class="control-group"><span class="ctrl-label" id="colorLabel">I’m playing as</span><div class="toggle-group" id="colorToggle" role="group" aria-labelledby="colorLabel"><button type="button" class="toggle-btn active" data-val="w" aria-pressed="true"><span class="piece-dot white"></span> White</button><button type="button" class="toggle-btn" data-val="b" aria-pressed="false"><span class="piece-dot black"></span> Black</button></div></div>
+          <div class="field-row"><label for="orientationSelect">Board orientation</label><select id="orientationSelect"><option value="auto">Detect automatically</option><option value="w">White at bottom</option><option value="b">Black at bottom</option></select></div>
+          <div class="control-group strength-control"><div class="ctrl-label"><label for="depthSlider">Analysis depth</label><span class="depth-value"><span id="depthVal">10</span><span class="depth-unit"> / 16</span></span></div><input type="range" id="depthSlider" min="4" max="16" value="10" step="1" /><div class="range-labels"><span>Faster</span><span>Deeper</span></div><span id="eloHint" class="visually-hidden"></span></div>
+          <details class="advanced-settings" id="setupPanel">
+            <summary>Position &amp; preferences <svg class="icon"><use href="#i-chevron" /></svg></summary>
+            <div class="advanced-content">
+              <div class="control-group"><span class="ctrl-label" id="modeLabel">Suggestion style</span><div class="toggle-group" id="modeToggle" role="group" aria-labelledby="modeLabel"><button type="button" class="toggle-btn active" data-val="win" aria-pressed="true">Strongest</button><button type="button" class="toggle-btn" data-val="loss" aria-pressed="false">Casual</button></div></div>
+              <div class="field-row"><label for="turnSelect">Side to move at setup</label><select id="turnSelect"><option value="w">White</option><option value="b">Black</option></select></div>
+              <div class="fen-field"><label class="ctrl-label" for="customFenInput">Set an existing position</label><p class="field-help">Starting a game is automatic. For a game already in progress, enter its FEN once to identify the pieces.</p><textarea id="customFenInput" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste the board’s FEN position…" aria-describedby="fenHelp"></textarea><p id="fenHelp" class="field-help">Use this position for camera tracking, or analyze it on its own.</p></div>
+              <div class="setup-actions"><button type="button" class="btn btn-primary btn-small" id="btnSetPosition">Use for camera</button><button type="button" class="btn btn-secondary btn-small" id="btnAnalyzeFen">Analyze FEN</button></div>
+              <button type="button" class="text-btn reset-btn" id="btnResetPosition"><svg class="icon"><use href="#i-flip" /></svg> Reset to a new game</button>
             </div>
-            <div class="move-text" id="moveText">Move Pawn to e4</div>
-          </div>
-        </div>
-
-        <!-- Recent Suggestions History -->
-        <div class="recent-moves-container" id="recentContainer" style="display:none;">
-          <span class="recent-label">Recent Moves:</span>
-          <div class="recent-pills" id="recentPills"></div>
-        </div>
-
-        <!-- Status bar -->
-        <div class="status-bar" id="statusBar" role="status" aria-live="polite">
-          <span class="status-indicator-dot"></span>
-          <span id="statusMsg">Ready for moves.</span>
-        </div>
-      </div>
-
-      <!-- Mode Info Card -->
-      <div class="card info-card" id="modeInfoCard">
-        <div class="mode-info" id="modeInfo">
-          <span class="mode-icon">🏆</span>
-          <div>
-            <strong>Win Mode</strong>
-            <p>Calculates sharp, decisive, high-accuracy moves tailored to win quickly.</p>
-          </div>
-        </div>
-      </div>
-
-    </section>
+          </details>
+        </section>
+        <div class="how-it-works"><span class="how-icon"><svg class="icon"><use href="#i-scan" /></svg></span><div><h3>One view. Every move.</h3><p>The arrow stays on your camera view. Make your move, then let the board settle for the next suggestion.</p></div></div>
+      </aside>
+    </div>
   </main>
-
-  <!-- Footer -->
-  <footer class="footer">
-    <div class="footer-inner">
-      <span>Chess Vision Coach • Ultra-lightweight overhead camera analyzer</span>
-      <span class="footer-links">
-        <button class="footer-link-btn" id="btnConfigApi">Configure API</button>
-        •
-        <a href="https://github.com/Pyrexus/Chess-machine" target="_blank" rel="noopener" class="footer-link">GitHub Repository</a>
-      </span>
-    </div>
-  </footer>
-
-  <!-- API URL Modal -->
+  <footer class="footer"><span>See clearly. Play thoughtfully.</span><div><button type="button" class="text-btn" id="btnConfigApi">Connection settings</button><a href="https://github.com/Pyrexus/Chess-machine" target="_blank" rel="noopener">GitHub <span aria-hidden="true">↗</span></a></div></footer>
   <dialog class="modal-dialog" id="apiModal" aria-labelledby="apiModalTitle">
-    <div class="modal-content">
-      <h3 class="modal-title" id="apiModalTitle">Backend API Settings</h3>
-      <p class="modal-desc">Configure the Railway or local FastAPI backend server URL:</p>
-      <input type="url" id="apiUrlInput" class="modal-input" placeholder="https://your-service.up.railway.app" />
-      <div class="modal-status" id="modalPingStatus">Testing connection…</div>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" id="btnTestPing">Test Connection</button>
-        <button class="btn btn-secondary" id="btnResetApiDefault">Reset Default</button>
-        <button class="btn btn-start" id="btnSaveApi">Save & Close</button>
-      </div>
-    </div>
+    <div class="modal-content"><div class="card-heading"><h2 id="apiModalTitle">Engine connection</h2><button type="button" class="btn btn-icon" id="btnCloseApi" aria-label="Close connection settings">×</button></div><p class="field-help">Choose the server that analyzes your board. Leave the address empty to use this website’s server.</p><label class="ctrl-label" for="apiUrlInput">Server address</label><input type="url" id="apiUrlInput" class="modal-input" placeholder="https://your-service.up.railway.app" /><div class="modal-status" id="modalPingStatus" role="status"></div><div class="modal-actions"><button type="button" class="btn btn-secondary btn-small" id="btnTestPing">Test connection</button><button type="button" class="btn btn-secondary btn-small" id="btnResetApiDefault">Reset</button><button type="button" class="btn btn-primary btn-small" id="btnSaveApi">Save</button></div></div>
   </dialog>
-
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

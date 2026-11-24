@@ -8,7 +8,10 @@
 
 # Cache static assets
 /style.css
-  Cache-Control: public, max-age=86400
+  Cache-Control: no-cache
 
 /app.js
-  Cache-Control: public, max-age=86400
+  Cache-Control: no-cache
+
+/overlay.js
+  Cache-Control: no-cache

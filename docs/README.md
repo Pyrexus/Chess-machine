@@ -1,238 +1,83 @@
-# Chess Vision Coach
+# Setup and camera workflow
 
-A lightweight web-based chess move suggester powered by Stockfish + OpenCV.
-Point your phone camera at the board — get your next move instantly.
+## How the app works
 
----
+The frontend captures the complete camera image into a square canvas with letterboxing rather than cropping away board corners. The backend detects the board quadrilateral, verifies its alternating 8-by-8 pattern, and measures piece color and occupied squares. The returned corners and move coordinates are normalized to that same captured image.
 
-## Architecture Decisions
+The frontend uses a perspective transform to draw the move arrow over the live camera or uploaded photo. It does not open a separate board-overlay window.
 
-### Why Cloudflare Pages (not GitHub Pages)?
+Piece identity comes from a known position: either the normal opening setup or an exact FEN supplied by the user. Legal move matching then preserves kings, queens, other piece types, side to move, castling rights, and en passant information. The detector never repairs an unreadable image by adding kings, changing pieces to queens, or deleting attacking pieces.
 
-| Feature | GitHub Pages | Cloudflare Pages |
-|---|---|---|
-| HTTPS | ✓ | ✓ |
-| Camera API (requires HTTPS) | ✓ | ✓ |
-| Edge CDN | Basic | Global PoPs (faster in India) |
-| Custom headers (Permissions-Policy) | ✗ | ✓ (via `_headers`) |
-| Deploy from CLI | Extra setup | `wrangler pages deploy` |
+## Start a new game
 
-**Chosen: Cloudflare Pages** — custom headers let us set `Permissions-Policy: camera=*`
-explicitly, which avoids camera permission issues on some Android browsers.
-GitHub Pages works too if you prefer it (just push frontend/ to gh-pages branch).
+1. Arrange the pieces in their normal starting positions.
+2. Select your playing color and the color at the bottom of the camera view.
+3. Select **Start camera** and allow camera access in the browser.
+4. Keep all 64 squares visible, preferably from overhead with even light.
+5. Once the board is locked, follow the arrow and the move written below the camera view.
 
----
+After you move, the app watches for your opponent's reply. An unchanged board retains the current suggestion; a detected opponent turn clears it. Keep hands clear while a new position is being read.
 
-### Why OpenCV (not YOLOv8)?
+## Analyze an existing game
 
-| | OpenCV | YOLOv8 |
-|---|---|---|
-| Model size | 0 MB | ~50-200 MB |
-| Inference time | ~20-40ms | ~100-200ms (CPU) |
-| GPU required | No | No (but much slower) |
-| Accuracy (overhead angle, stable board) | Good | Excellent |
-| Railway RAM usage | Low | High |
+Open **Position & preferences**, enter the exact current FEN, choose the side to move, and select **Use for camera** while the camera or photo is visible. The backend checks that the observed piece colors and occupancy match that setup before starting tracking. Piece types cannot be verified from color and occupancy alone, so the FEN must describe the real board accurately.
 
-**Chosen: OpenCV** for this use-case (stable overhead phone camera, standard board).
-YOLOv8 would be the right choice if: boards are partially visible, taken at odd angles,
-or pieces are exotic 3D sets. The hybrid approach (OpenCV for board detection, YOLO
-for piece classification) would be the ideal future upgrade.
+**Analyze FEN** evaluates a position directly and displays an example board in the same square frame. **Try a demo** provides a starting-position example without camera access.
 
----
+The vision pipeline does not independently identify arbitrary midgame pieces. It needs calibration when joining a game midway, after more than two moves are missed, or when several legal positions have identical observed occupancy, such as different promotion choices.
 
-## Project Structure
+## Board alignment
 
-```
-chess-vision-coach/
-├── frontend/
-│   ├── index.html       # Single-page UI
-│   ├── style.css        # Dark theme, Space Grotesk font
-│   ├── app.js           # Camera capture, API calls, UI logic
-│   └── _headers         # Cloudflare Pages HTTP headers
-│
-├── backend/
-│   ├── main.py          # FastAPI app, lifespan startup
-│   ├── Procfile         # Railway process definition
-│   ├── nixpacks.toml    # Installs stockfish binary on Railway
-│   ├── requirements.txt
-│   ├── routers/
-│   │   └── analysis.py  # POST /api/analyze, GET /api/depth-info
-│   └── services/
-│       ├── stockfish_service.py  # Persistent Stockfish wrapper
-│       └── board_detector.py     # OpenCV board + piece detection
-│
-├── docs/
-│   ├── README.md        # ← you are here
-│   ├── API.md           # Full API reference
-│   └── PERFORMANCE.md   # Optimization notes
-│
-└── models/              # Empty — reserved for future YOLO weights
-```
+Automatic alignment verifies the board pattern instead of treating any rectangle as a chessboard. When automatic alignment is difficult, select **Set corners** and tap the board's top-left, top-right, bottom-right, then bottom-left corner. Crossed or degenerate corners are rejected. **Unlock** clears the calibration and scans again.
 
----
+Orientation describes the camera view, independently of whose turn it is or which color you play. Turning the camera to the opposite side requires changing the orientation and recalibrating. A partial board, glare, low contrast, or a hand over pieces can cause the app to withhold a suggestion until a readable frame returns.
 
-## Local Setup
+## Local development
 
-### Prerequisites
+From the repository root on Windows:
 
-- Python 3.11+
-- Stockfish installed locally
-  - **Ubuntu/Debian:** `sudo apt install stockfish`
-  - **macOS:** `brew install stockfish`
-  - **Windows:** Download from https://stockfishchess.org/download/
-
-### Backend
-
-```bash
-cd backend
+```powershell
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-# If Stockfish is not at /usr/games/stockfish, set the path:
-export STOCKFISH_PATH=/path/to/stockfish
-
-uvicorn main:app --reload --port 8000
+& .venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+& .venv\Scripts\python.exe -m uvicorn main:app --app-dir backend --reload --host 127.0.0.1 --port 8080
 ```
 
-API will be available at: http://localhost:8000
-Docs at: http://localhost:8000/docs
+On macOS or Linux, use `.venv/bin/python` in place of `.venv\Scripts\python.exe`. Open `http://127.0.0.1:8080` for the app and `/docs` for interactive API documentation.
 
-### Frontend
+Install Stockfish through your system package manager or [the official download page](https://stockfishchess.org/download/). Set `STOCKFISH_PATH` if the executable is not discoverable. Health and move responses distinguish Stockfish from the weaker Python fallback.
 
-```bash
-# No build step needed — pure HTML/CSS/JS
+The frontend is plain HTML, CSS, and JavaScript modules. No frontend compilation is needed. Serve it through FastAPI to use the local API automatically. If a separate frontend server runs on another port, use its URL with `?api=http://127.0.0.1:8080` or select the API in **Connection settings**.
 
-# Option 1: Python simple server
-cd frontend
-python -m http.server 5500
+## Project layout
 
-# Option 2: VS Code Live Server extension
-
-# Option 3: npx serve
-npx serve frontend/
+```text
+frontend/
+  index.html        Mobile-first camera UI
+  style.css         Responsive styles
+  app.js            Camera, requests, tracking UI, and overlay rendering
+  overlay.js        Perspective and square-coordinate helpers
+  tests/            Frontend regression tests
+  _headers          Headers for separate static hosting
+backend/
+  main.py           FastAPI startup, health, and static frontend serving
+  routers/analysis.py
+  services/board_detector.py
+  services/stockfish_service.py
+  tests/
+  requirements.txt
+Dockerfile          Root deployment: backend and frontend together
+railway.json        Railway build and health-check configuration
 ```
 
-**Important:** Edit `frontend/app.js` line 12:
-```js
-const API_BASE = "http://localhost:8000";  // for local dev
+## Deployment and checks
+
+See [Railway deployment](../backend/DEPLOY.md) for the recommended single-service deployment. A separate static host can publish `frontend/` with no build command and select the Railway API through connection settings.
+
+```powershell
+& .venv\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider
+npm install
+npm test
+npm run test:browser
 ```
 
----
-
-## Railway Deployment (Backend)
-
-1. **Create Railway project**
-   ```
-   railway login
-   railway new chess-vision-coach
-   ```
-
-2. **Link backend folder**
-   ```
-   cd backend
-   railway link
-   ```
-
-3. **Set environment variables** (in Railway dashboard or CLI)
-   ```
-   STOCKFISH_PATH=/run/current-system/sw/bin/stockfish
-   PORT=8000
-   ```
-   > `nixpacks.toml` automatically installs stockfish via Nix packages.
-   > After first deploy, check the exact binary path in Railway logs and update STOCKFISH_PATH if needed.
-
-4. **Deploy**
-   ```
-   railway up
-   ```
-
-5. **Get your Railway URL**
-   Railway will assign: `https://your-app-name.up.railway.app`
-
-6. **Update frontend** — edit `frontend/app.js`:
-   ```js
-   const API_BASE = "https://your-app-name.up.railway.app";
-   ```
-
----
-
-## Cloudflare Pages Deployment (Frontend)
-
-1. **Install Wrangler**
-   ```
-   npm install -g wrangler
-   wrangler login
-   ```
-
-2. **Deploy**
-   ```
-   cd frontend
-   wrangler pages deploy . --project-name chess-vision-coach
-   ```
-
-3. Your app is live at: `https://chess-vision-coach.pages.dev`
-
-**Alternative — GitHub auto-deploy:**
-1. Push repo to GitHub.
-2. Go to Cloudflare Pages → Create Project → Connect to Git.
-3. Set build output directory: `frontend/`
-4. Leave build command empty.
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `STOCKFISH_PATH` | `/usr/games/stockfish` | Absolute path to the Stockfish binary |
-| `PORT` | `8000` | HTTP port (Railway sets this automatically) |
-
----
-
-## API Reference
-
-See `docs/API.md` for full details.
-
-### Quick reference
-
-**POST `/api/analyze`**
-```json
-{
-  "image_b64":    "<base64-encoded JPEG>",
-  "player_color": "w",
-  "depth":        10,
-  "mode":         "win",
-  "session_id":   "abc123"
-}
-```
-
-**Response (success):**
-```json
-{
-  "status":          "ok",
-  "fen":             "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-  "turn":            "w",
-  "move_uci":        "e2e4",
-  "move_san":        "e4",
-  "move_human":      "Move Pawn to e4",
-  "confidence":      0.87,
-  "approx_elo":      1900,
-  "board_image_b64": "<base64 PNG with move arrow>"
-}
-```
-
-**Other statuses:** `no_change` · `opponent_turn` · `detection_error` · `rate_limited` · `game_over`
-
----
-
-## Performance Notes
-
-See `docs/PERFORMANCE.md` for full details.
-
-- **Frame capture:** 480×480 px JPEG at quality 0.82 ≈ 30-60 KB per upload.
-- **Poll interval:** 2500ms (one frame every 2.5 seconds) is plenty for over-the-board play.
-- **Duplicate frame skip:** SHA-1 hash of first 2KB avoids sending identical frames.
-- **Persistent Stockfish:** Engine started once at boot; each request reuses the same process.
-- **FEN cache:** Board changes detected before calling Stockfish — zero engine calls for unchanged positions.
-- **OpenCV no-model:** No model weights to load; board detection is instant CPU math.
+See [API reference](API.md) for request and response details and [performance notes](PERFORMANCE.md) for timing and tracking limits.

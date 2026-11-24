@@ -25,3 +25,9 @@ models/*.weights
 
 # Node (if using Wrangler CLI)
 node_modules/
+
+# Local verification and deployment artifacts
+.tmp/
+.pytest_cache/
+.wrangler/
+test-results/
