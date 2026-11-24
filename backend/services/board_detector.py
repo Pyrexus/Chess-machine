@@ -1,14 +1,23 @@
+"""Board localisation and legal-move tracking without invented piece identities.
+
+OpenCV measures the board and piece colour/occupancy, not arbitrary piece type.
+Calibrate a standard new game or a supplied FEN, then match legal moves to retain
+identities. An unrecognised position is never repaired into a different position.
+"""
+
+import base64
+import logging
+
+import chess
 import cv2
 import numpy as np
-import logging
-import base64
-import chess
 
 logger = logging.getLogger(__name__)
+TARGET_SIZE = 960
+WARP_SIZE = 480
+MIN_BOARD_AREA_FRACTION = 0.08
+STARTING_FEN = chess.STARTING_FEN
 
-TARGET_SIZE = 480
-MIN_BOARD_AREA_FRACTION = 0.10
-STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 class BoardDetector:
     def __init__(self):
@@ -16,341 +25,370 @@ class BoardDetector:
 
     def load(self):
         self._ready = True
-        logger.info("BoardDetector ready (OpenCV).")
+        logger.info("BoardDetector ready (verified checkerboard + legal tracking).")
 
-    def detect(self, image_bytes: bytes, player_color: str = "w") -> dict:
-        """
-        Detect chess board from image bytes.
-        Returns dict with: fen, turn, confidence, error, board_b64
-        """
+    def detect(self, image_bytes: bytes, player_color: str = "w",
+               orientation: str = "w", previous_fen: str | None = None,
+               board_corners: list | None = None, setup_fen: str | None = None) -> dict:
         if not self._ready:
             return _err("Detector not initialised.")
-
         try:
-            img = self._decode(image_bytes)
-        except Exception as e:
-            return _err(f"Could not decode image: {e}")
+            img = self._resize(self._decode(image_bytes))
+        except (ValueError, cv2.error) as exc:
+            return _err(f"Could not decode image: {exc}")
 
-        img = self._resize(img)
-        corners, conf_c = self._find_corners(img)
-
+        h, w = img.shape[:2]
+        if min(h, w) < 64:
+            return _err("Image is too small to read a chessboard. Use a full-resolution photo.")
+        corners, corner_confidence = None, 0.0
+        if board_corners is not None:
+            try:
+                supplied = np.asarray(board_corners, dtype=np.float32)
+                if supplied.shape == (4, 2) and np.isfinite(supplied).all() and (
+                        supplied >= 0).all() and (supplied <= 1).all():
+                    candidate = supplied * np.array([w - 1, h - 1], np.float32)
+                    if (cv2.isContourConvex(candidate) and
+                            cv2.contourArea(candidate) >= h * w * MIN_BOARD_AREA_FRACTION):
+                        candidate = _order_points(candidate)
+                        score = self._checker_score(self._warp(img, candidate))
+                        if score >= 0.65:
+                            corners, corner_confidence = candidate, score
+            except (ValueError, cv2.error):
+                pass
         if corners is None:
-            return _err(
-                "Board not found. Ensure the full board is visible and well-lit.",
-                confidence=conf_c,
-            )
+            corners, corner_confidence = self._find_corners(img)
+        if corners is None:
+            return _err("Board not found. Keep all 64 squares visible and use an overhead view.")
 
         warped = self._warp(img, corners)
-        matrix, conf_p = self._classify_squares(warped)
-        overall = round(conf_c * 0.4 + conf_p * 0.6, 3)
-
-        if overall < 0.40:
-            return _err(
-                "Board confidence too low. Move camera closer or improve lighting.",
-                confidence=overall,
-            )
-
-        fen, turn = self._matrix_to_fen(matrix, overall, player_color=player_color)
-        valid, fen = self._ensure_valid_fen(fen, turn)
-
-        if not valid:
-            return _err(
-                "Could not read board clearly. Ensure all pieces are visible.",
-                confidence=overall,
-            )
-
-        board_b64 = self._encode_annotated(warped)
-        return {
-            "fen": fen,
-            "turn": turn,
-            "confidence": overall,
-            "error": None,
-            "board_b64": board_b64,
+        matrix, piece_confidence = self._classify_squares(warped)
+        confidence = round(0.45 * corner_confidence + 0.55 * piece_confidence, 3)
+        result = {
+            "fen": None, "turn": None, "confidence": confidence,
+            "error": None, "status": "ok", "board_detected": True,
+            "board_corners": np.clip(corners / np.array([w - 1, h - 1]), 0, 1).round(6).tolist(),
+            "orientation": "b" if orientation == "b" else "w",
+            "requires_setup": False, "board_b64": _cv2_to_b64(warped),
+            "occupancy": matrix,
+            "piece_count": sum(cell in ("W", "B") for row in matrix for cell in row),
+            "pieces_detected": any(cell in ("W", "B") for row in matrix for cell in row),
         }
 
-    def draw_move(self, board_b64: str, uci_move: str) -> str:
-        try:
-            img = _b64_to_cv2(board_b64)
-            h, w = img.shape[:2]
-            sq = w // 8
-            fx, fy = _sq_to_pixel(uci_move[:2], sq)
-            tx, ty = _sq_to_pixel(uci_move[2:4], sq)
-            col = (ord(uci_move[2]) - ord("a")) * sq
-            row = (8 - int(uci_move[3])) * sq
-            overlay = img.copy()
-            cv2.rectangle(overlay, (col, row), (col + sq, row + sq), (0, 210, 90), -1)
-            cv2.addWeighted(overlay, 0.30, img, 0.70, 0, img)
-            cv2.arrowedLine(img, (fx, fy), (tx, ty), (0, 210, 90), thickness=4, tipLength=0.35)
-            return _cv2_to_b64(img)
-        except Exception as e:
-            logger.warning(f"draw_move failed: {e}")
-            return board_b64
+        known_fen = setup_fen or previous_fen
+        if known_fen:
+            valid, canonical = self._ensure_valid_fen(known_fen, "w")
+            if not valid:
+                return self._uncertain(result, "setup_required",
+                                       "The supplied position is illegal. Correct the board and side to move.")
+            board = chess.Board(canonical)
+            possibilities = []
+            choices = ("w", "b") if orientation == "auto" else (result["orientation"],)
+            for direction in choices:
+                observed = _orient(matrix, direction)
+                if setup_fen:
+                    matches = [board.fen()] if observed == _occupancy(board) else []
+                else:
+                    matches = self._match_legal_position(board, observed)
+                possibilities.extend((fen, direction) for fen in matches)
+            unique = {(fen, direction) for fen, direction in possibilities}
+            if len(unique) == 1:
+                fen, direction = unique.pop()
+                result.update(fen=fen, turn="w" if chess.Board(fen).turn else "b", orientation=direction)
+                return result
+            if len(unique) > 1:
+                return self._uncertain(result, "position_uncertain",
+                                       "More than one legal position fits. Confirm the position, including any promotion.")
+            message = ("The pieces do not match the setup. Check board orientation and the position."
+                       if setup_fen else
+                       "Pieces are moving or the position is unclear. Remove your hand and hold the camera steady.")
+            return self._uncertain(result, "position_uncertain", message)
 
-    def _decode(self, image_bytes: bytes) -> np.ndarray:
-        arr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        # Standard new-game calibration: middle-rank pieces are never guessed.
+        starting = _occupancy(chess.Board())
+        choices = ("w", "b") if orientation == "auto" else (result["orientation"],)
+        for direction in choices:
+            if _orient(matrix, direction) == starting:
+                result.update(fen=STARTING_FEN, turn="w", orientation=direction)
+                return result
+        return self._uncertain(result, "setup_required",
+                               "Board locked. Start with the standard opening layout, or set this position once to track the game.")
+
+    @staticmethod
+    def _uncertain(result, status, message):
+        result.update(status=status, error=message, requires_setup=status == "setup_required")
+        return result
+
+    @staticmethod
+    def _match_legal_position(board: chess.Board, observed: list) -> list[str]:
+        """Match unchanged, one ply, or two plies; retain every chess rule.
+
+        Matching is exact. A partly moved piece/hand cannot commit a speculative
+        position, and promotions with identical occupancy remain ambiguous.
+        """
+        if observed == _occupancy(board):
+            return [board.fen()]
+        one_ply = []
+        first_moves = list(board.legal_moves)
+        for move in first_moves:
+            board.push(move)
+            if observed == _occupancy(board):
+                one_ply.append(board.fen())
+            board.pop()
+        if one_ply:
+            return list(dict.fromkeys(one_ply))
+        two_ply = []
+        for first in first_moves:
+            board.push(first)
+            # One reply changes at most four squares (castling).
+            if _difference(_occupancy(board), observed) <= 4:
+                for second in list(board.legal_moves):
+                    board.push(second)
+                    if observed == _occupancy(board):
+                        two_ply.append(board.fen())
+                    board.pop()
+            board.pop()
+        return list(dict.fromkeys(two_ply))
+
+    @staticmethod
+    def _ensure_valid_fen(fen: str, turn: str) -> tuple[bool, str]:
+        try:
+            board = chess.Board(fen)
+            return board.is_valid(), board.fen()
+        except (ValueError, TypeError):
+            return False, fen
+
+    @staticmethod
+    def _decode(image_bytes: bytes) -> np.ndarray:
+        if not image_bytes:
+            raise ValueError("Empty image.")
+        img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError("cv2.imdecode returned None.")
+            raise ValueError("Not a supported image.")
         return img
 
-    def _resize(self, img: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _resize(img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
         if max(h, w) > TARGET_SIZE:
             scale = TARGET_SIZE / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
         return img
 
     def _find_corners(self, img: np.ndarray):
+        """Only accept quadrilaterals containing a verified 8x8 checker pattern."""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 30, 100)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
+        h, w = gray.shape
+        candidates = [np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)]
+        frame_score = self._checker_score(self._warp(img, candidates[0]))
+        if frame_score >= 0.95:
+            return candidates[0], round(frame_score, 3)
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 30, 100)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8))
+        _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        for source in (edges, threshold, 255 - threshold):
+            contours, _ = cv2.findContours(source, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
+                if cv2.contourArea(contour) < h * w * MIN_BOARD_AREA_FRACTION:
+                    continue
+                approx = cv2.approxPolyDP(contour, 0.025 * cv2.arcLength(contour, True), True)
+                if len(approx) == 4 and cv2.isContourConvex(approx):
+                    candidates.append(_order_points(approx.reshape(4, 2).astype(np.float32)))
 
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return None, 0.0
+        best, best_score = None, 0.0
+        for candidate in candidates:
+            # Wooden boards often have an outer border; search projectively inward.
+            for inset in (0.0, 0.02, 0.04, 0.06, 0.08):
+                test = _inset_corners(candidate, inset)
+                score = self._checker_score(self._warp(img, test))
+                if score > best_score:
+                    best, best_score = test, score
+        if best_score >= 0.78:
+            return best, round(best_score, 3)
 
-        img_area = img.shape[0] * img.shape[1]
-        best, best_area = None, 0
+        # Internal grid intersections recover an obscured outline. Avoid an
+        # exhaustive detector on every phone frame.
+        found, points = cv2.findChessboardCorners(
+            gray, (7, 7), cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FAST_CHECK)
+        if found:
+            grid = np.array([[x, y] for y in range(1, 8) for x in range(1, 8)], np.float32)
+            transform, _ = cv2.findHomography(grid, points.reshape(-1, 2))
+            if transform is not None:
+                outer = cv2.perspectiveTransform(np.array([[[0, 0], [8, 0], [8, 8], [0, 8]]], np.float32), transform)[0]
+                outer = _order_points(outer)
+                if (outer[:, 0] >= -2).all() and (outer[:, 0] <= w + 1).all() and (
+                        outer[:, 1] >= -2).all() and (outer[:, 1] <= h + 1).all():
+                    score = self._checker_score(self._warp(img, outer))
+                    if score > best_score:
+                        best, best_score = outer, score
+        return (best, round(best_score, 3)) if best_score >= 0.65 else (None, 0.0)
 
-        for cnt in cnts:
-            area = cv2.contourArea(cnt)
-            if area < img_area * MIN_BOARD_AREA_FRACTION:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            if len(approx) == 4 and area > best_area:
-                best_area = area
-                best = approx
+    @staticmethod
+    def _warp(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
+        dst = np.array([[0, 0], [WARP_SIZE - 1, 0], [WARP_SIZE - 1, WARP_SIZE - 1], [0, WARP_SIZE - 1]], np.float32)
+        transform = cv2.getPerspectiveTransform(_order_points(corners), dst)
+        return cv2.warpPerspective(img, transform, (WARP_SIZE, WARP_SIZE))
 
-        if best is None:
-            h, w = img.shape[:2]
-            corners = np.array([[0,0],[w,0],[w,h],[0,h]], dtype="float32")
-            return corners, 0.45
+    @staticmethod
+    def _backgrounds(board: np.ndarray) -> np.ndarray:
+        size = board.shape[0] // 8
+        cells = board[:size * 8, :size * 8].reshape(8, size, 8, size, 3).transpose(0, 2, 1, 3, 4)
+        patches = []
+        # Sample all 64 cells together. This avoids hundreds of Python/median
+        # calls for every candidate and keeps camera localisation responsive.
+        for py, px in ((0.14, 0.14), (0.14, 0.86), (0.86, 0.14), (0.86, 0.86)):
+            y, x = int(py * size), int(px * size)
+            patches.append(np.median(cells[:, :, y - 2:y + 3, x - 2:x + 3], axis=(2, 3)))
+        return np.median(np.stack(patches), axis=0).astype(np.float32)
 
-        corners = best.reshape(4, 2).astype("float32")
-        conf = min(1.0, best_area / (img_area * 0.70))
-        return corners, round(conf, 3)
-
-    def _warp(self, img: np.ndarray, corners: np.ndarray) -> np.ndarray:
-        size = 480
-        dst = np.array([[0,0],[size,0],[size,size],[0,size]], dtype="float32")
-        corners = _order_points(corners)
-        M = cv2.getPerspectiveTransform(corners, dst)
-        return cv2.warpPerspective(img, M, (size, size))
+    def _checker_score(self, board: np.ndarray) -> float:
+        colours = self._backgrounds(board)
+        parity = np.indices((8, 8)).sum(axis=0) % 2
+        means = [np.median(colours[parity == value], axis=0) for value in (0, 1)]
+        contrast = float(np.linalg.norm(means[0] - means[1]))
+        if contrast < 35:
+            return 0.0
+        distances = np.stack([np.linalg.norm(colours - mean, axis=2) for mean in means], axis=2)
+        agreement = float(np.mean(np.argmin(distances, axis=2) == parity))
+        # Rectangles, stripes, and partially cropped grids must not lock.
+        if agreement < 0.88:
+            return 0.0
+        residual = float(np.median(np.min(distances, axis=2))) / contrast
+        return float(np.clip(agreement * (1 - min(residual, 0.35)), 0, 1))
 
     def _classify_squares(self, board: np.ndarray):
-        sq = board.shape[0] // 8
-        hsv = cv2.cvtColor(board, cv2.COLOR_BGR2HSV)
-        matrix, confs = [], []
-
+        size = board.shape[0] // 8
+        backgrounds = self._backgrounds(board)
+        lab = cv2.cvtColor(board, cv2.COLOR_BGR2LAB).astype(np.float32)
+        background_lab = cv2.cvtColor(backgrounds.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+        entries = []
         for row in range(8):
-            rank = []
             for col in range(8):
-                x0, y0 = col * sq, row * sq
-                x1, y1 = x0 + sq, y0 + sq
-                m = sq // 5
-                cell = hsv[y0+m:y1-m, x0+m:x1-m]
-
-                if cell.size == 0:
-                    rank.append("empty")
-                    confs.append(0.5)
+                cell = lab[row * size:(row + 1) * size, col * size:(col + 1) * size]
+                margin = max(3, size // 10)
+                interior = cell[margin:-margin, margin:-margin]
+                distance = np.linalg.norm(interior - background_lab[row, col], axis=2)
+                # Phone exposure and wood grain change the background noise.
+                # A fixed threshold misses pale wooden pieces on light squares.
+                # Measure noise where the square background was sampled and
+                # separate coherent foreground from that local variation.
+                corner_noise = []
+                for py, px in ((0.14, 0.14), (0.14, 0.86), (0.86, 0.14), (0.86, 0.86)):
+                    y, x = int(py * size), int(px * size)
+                    patch = cell[y - 2:y + 3, x - 2:x + 3]
+                    corner_noise.extend(np.linalg.norm(patch - background_lab[row, col], axis=2).ravel())
+                threshold = max(14.0, float(np.percentile(corner_noise, 90)) * 1.75 + 3)
+                mask = (distance > threshold).astype(np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+                if count <= 1:
+                    entries.append(("empty", None, 0.98))
                     continue
-
-                mean_v = float(np.mean(cell[:, :, 2]))
-                mean_s = float(np.mean(cell[:, :, 1]))
-                is_light = (row + col) % 2 == 0
-
-                if is_light:
-                    if mean_v < 110:
-                        rank.append("B"); confs.append(min(1.0, (130-mean_v)/130))
-                    elif mean_v > 175 and mean_s < 35:
-                        rank.append("empty"); confs.append(0.75)
-                    else:
-                        rank.append("W"); confs.append(0.60)
-                else:
-                    if mean_v > 195 and mean_s < 45:
-                        rank.append("W"); confs.append(min(1.0, (mean_v-170)/85))
-                    elif mean_v < 85:
-                        rank.append("empty"); confs.append(0.70)
-                    else:
-                        rank.append("B"); confs.append(0.55)
-
-            matrix.append(rank)
-
-        return matrix, round(float(np.mean(confs)), 3)
-
-    def _matrix_to_fen(self, matrix: list, confidence: float, player_color: str = "w") -> tuple[str, str]:
-        WHITE_BACK = list("RNBQKBNR")
-        BLACK_BACK = list("rnbqkbnr")
-
-        ranks = []
-        for row_idx, row in enumerate(matrix):
-            rank_str = ""
-            empty_run = 0
-            for col_idx, cell in enumerate(row):
-                if cell == "empty":
-                    empty_run += 1
+                index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                fraction = int(stats[index, cv2.CC_STAT_AREA]) / interior.shape[0] / interior.shape[1]
+                if fraction < 0.035:
+                    entries.append(("empty", None, 0.9))
                     continue
-                if empty_run:
-                    rank_str += str(empty_run)
-                    empty_run = 0
+                # A hand spanning most of a square is not a chess piece.
+                if fraction > 0.82:
+                    entries.append(("?", None, 0.2))
+                    continue
+                lightness = float(np.median(interior[:, :, 0][labels == index]))
+                entries.append(("piece", lightness, min(0.98, 0.65 + fraction)))
 
-                if cell == "B":
-                    if row_idx == 0:
-                        rank_str += BLACK_BACK[col_idx]
-                    elif row_idx == 7:
-                        # Pawns cannot exist on 1st rank
-                        rank_str += "q"
-                    else:
-                        rank_str += "p"
-                else:
-                    if row_idx == 7:
-                        rank_str += WHITE_BACK[col_idx]
-                    elif row_idx == 0:
-                        # Pawns cannot exist on 8th rank
-                        rank_str += "Q"
-                    else:
-                        rank_str += "P"
-
-            if empty_run:
-                rank_str += str(empty_run)
-            if not rank_str:
-                rank_str = "8"
-            ranks.append(rank_str)
-
-        board_str = "/".join(ranks)
-        turn = player_color.lower() if player_color in ("w", "b") else "w"
-        fen = f"{board_str} {turn} - - 0 1"
-        return fen, turn
-
-    def _ensure_valid_fen(self, fen: str, turn: str) -> tuple[bool, str]:
-        try:
-            board = chess.Board(fen)
-            if board.is_valid():
-                return True, fen
-        except Exception:
-            pass
-
-        try:
-            board = chess.Board(fen)
-        except Exception:
-            logger.warning("FEN completely invalid, using starting position.")
-            return True, STARTING_FEN
-
-        # 1. Ensure exactly one White King
-        white_kings = list(board.pieces(chess.KING, chess.WHITE))
-        if not white_kings:
-            # Place on e1 if empty, else find first empty square on rank 1
-            placed = False
-            for sq in [chess.E1, chess.F1, chess.D1, chess.G1, chess.C1]:
-                if board.piece_at(sq) is None:
-                    board.set_piece_at(sq, chess.Piece(chess.KING, chess.WHITE))
-                    placed = True
+        levels = [value for kind, value, _ in entries if kind == "piece"]
+        # Legal positions contain both kings. Adapt lighter/darker piece colour
+        # clusters to wood tones and exposure instead of hardcoded square RGB.
+        if len(levels) >= 2:
+            low, high = min(levels), max(levels)
+            for _ in range(6):
+                midpoint = (low + high) / 2
+                darker = [value for value in levels if value < midpoint]
+                lighter = [value for value in levels if value >= midpoint]
+                if not darker or not lighter:
                     break
-            if not placed:
-                board.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
-        elif len(white_kings) > 1:
-            while len(white_kings) > 1:
-                board.remove_piece_at(white_kings.pop())
+                low, high = float(np.median(darker)), float(np.median(lighter))
+            threshold = (low + high) / 2
+            distinguishable = high - low >= 25
+        else:
+            threshold, distinguishable = 128, False
+        cells, confidence = [], []
+        for kind, value, certainty in entries:
+            if kind == "piece":
+                kind = ("W" if value >= threshold else "B") if distinguishable else "?"
+                if kind == "?":
+                    certainty = 0.2
+            cells.append(kind)
+            confidence.append(certainty)
+        return [cells[index:index + 8] for index in range(0, 64, 8)], round(float(np.mean(confidence)), 3)
 
-        # 2. Ensure exactly one Black King
-        black_kings = list(board.pieces(chess.KING, chess.BLACK))
-        if not black_kings:
-            placed = False
-            for sq in [chess.E8, chess.F8, chess.D8, chess.G8, chess.C8]:
-                if board.piece_at(sq) is None:
-                    board.set_piece_at(sq, chess.Piece(chess.KING, chess.BLACK))
-                    placed = True
-                    break
-            if not placed:
-                board.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
-        elif len(black_kings) > 1:
-            while len(black_kings) > 1:
-                board.remove_piece_at(black_kings.pop())
-
-        # 3. Disallow pawns on back ranks (convert to Queens)
-        for sq in list(board.pieces(chess.PAWN, chess.WHITE)):
-            if chess.square_rank(sq) in (0, 7):
-                board.set_piece_at(sq, chess.Piece(chess.QUEEN, chess.WHITE))
-        for sq in list(board.pieces(chess.PAWN, chess.BLACK)):
-            if chess.square_rank(sq) in (0, 7):
-                board.set_piece_at(sq, chess.Piece(chess.QUEEN, chess.BLACK))
-
-        # 4. Ensure kings are not adjacent
-        w_king = board.king(chess.WHITE)
-        b_king = board.king(chess.BLACK)
-        if w_king is not None and b_king is not None:
-            if chess.square_distance(w_king, b_king) < 2:
-                for candidate in [chess.E8, chess.A8, chess.H8, chess.A7, chess.H7]:
-                    if candidate != w_king and chess.square_distance(w_king, candidate) >= 2:
-                        board.remove_piece_at(b_king)
-                        board.set_piece_at(candidate, chess.Piece(chess.KING, chess.BLACK))
-                        break
-
-        # 5. Handle illegal simultaneous opposite checks (detection noise artifact)
-        if board.status() & chess.STATUS_OPPOSITE_CHECK:
-            moving_color = chess.WHITE if turn == "w" else chess.BLACK
-            non_moving_color = chess.BLACK if turn == "w" else chess.WHITE
-            opp_king = board.king(non_moving_color)
-            if opp_king is not None:
-                attackers = list(board.attackers(moving_color, opp_king))
-                for att in attackers:
-                    if att != board.king(moving_color):
-                        board.remove_piece_at(att)
-                        break
-
-        repaired_fen = f"{board.board_fen()} {turn} - - 0 1"
+    def draw_move(self, board_b64: str, uci_move: str, orientation: str = "w") -> str:
+        """Compatibility helper; the web UI draws on the live camera instead."""
         try:
-            test_board = chess.Board(repaired_fen)
-            if test_board.is_valid():
-                return True, repaired_fen
+            img = _b64_to_cv2(board_b64)
+            size = img.shape[0] // 8
+            start, end = (_sq_to_pixel(uci_move[:2], size, orientation),
+                          _sq_to_pixel(uci_move[2:4], size, orientation))
+            overlay = img.copy()
+            cv2.circle(overlay, end, int(size * 0.4), (90, 210, 0), -1)
+            cv2.addWeighted(overlay, 0.3, img, 0.7, 0, img)
+            cv2.arrowedLine(img, start, end, (90, 210, 0), thickness=5, tipLength=0.3)
+            return _cv2_to_b64(img)
+        except (ValueError, cv2.error, IndexError, TypeError) as exc:
+            logger.warning("draw_move failed: %s", exc)
+            return board_b64
 
-            # If opposite king is in check, switch turn to escape check
-            if test_board.status() & chess.STATUS_OPPOSITE_CHECK:
-                opp_turn = "b" if turn == "w" else "w"
-                repaired_fen = f"{board.board_fen()} {opp_turn} - - 0 1"
-                if chess.Board(repaired_fen).is_valid():
-                    return True, repaired_fen
 
-            return True, repaired_fen
-        except Exception:
-            logger.warning("FEN repair failed, using starting position.")
-            return True, STARTING_FEN
+def _err(message: str, confidence: float = 0.0) -> dict:
+    return {"fen": None, "turn": None, "confidence": confidence, "error": message,
+            "status": "detection_error", "board_detected": False, "board_corners": None,
+            "requires_setup": False, "board_b64": None, "piece_count": 0, "pieces_detected": False}
 
-    def _encode_annotated(self, board: np.ndarray) -> str:
-        annotated = board.copy()
-        sq = annotated.shape[0] // 8
-        for i in range(9):
-            cv2.line(annotated, (i*sq, 0), (i*sq, annotated.shape[0]), (160,160,160), 1)
-            cv2.line(annotated, (0, i*sq), (annotated.shape[1], i*sq), (160,160,160), 1)
-        return _cv2_to_b64(annotated)
 
-def _err(msg: str, confidence: float = 0.0) -> dict:
-    return {"fen": None, "turn": "w", "confidence": confidence,
-            "error": msg, "board_b64": None}
+def _occupancy(board: chess.Board) -> list:
+    return [[("W" if piece.color else "B") if (piece := board.piece_at(chess.square(col, 7 - row)))
+             else "empty" for col in range(8)] for row in range(8)]
 
-def _order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
 
-def _sq_to_pixel(sq_name: str, sq_size: int) -> tuple[int, int]:
-    col = ord(sq_name[0]) - ord("a")
-    row = 8 - int(sq_name[1])
-    return col * sq_size + sq_size // 2, row * sq_size + sq_size // 2
+def _orient(matrix: list, orientation: str) -> list:
+    return [list(reversed(row)) for row in reversed(matrix)] if orientation == "b" else matrix
+
+
+def _difference(first: list, second: list) -> int:
+    return sum(a != b for row_a, row_b in zip(first, second) for a, b in zip(row_a, row_b))
+
+
+def _order_points(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, np.float32)
+    # Sorting by sums/differences can select the same vertex twice when a
+    # board is rotated 45 degrees. Order around the centre first so every
+    # distinct vertex is retained, then start at the upper-left corner.
+    centre = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - centre[1], points[:, 0] - centre[0])
+    ordered = points[np.argsort(angles)]
+    return np.roll(ordered, -int(np.argmin(ordered.sum(axis=1))), axis=0)
+
+
+def _inset_corners(corners: np.ndarray, fraction: float) -> np.ndarray:
+    transform = cv2.getPerspectiveTransform(np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32), corners)
+    points = np.array([[[fraction, fraction], [1 - fraction, fraction],
+                        [1 - fraction, 1 - fraction], [fraction, 1 - fraction]]], np.float32)
+    return cv2.perspectiveTransform(points, transform)[0]
+
+
+def _sq_to_pixel(square: str, size: int, orientation: str = "w") -> tuple[int, int]:
+    index = chess.parse_square(square)
+    col, row = chess.square_file(index), 7 - chess.square_rank(index)
+    if orientation == "b":
+        col, row = 7 - col, 7 - row
+    return round((col + 0.5) * size), round((row + 0.5) * size)
+
 
 def _cv2_to_b64(img: np.ndarray) -> str:
-    _, buf = cv2.imencode(".png", img)
-    return base64.b64encode(buf).decode("utf-8")
+    success, buffer = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not success:
+        raise ValueError("Image encoding failed.")
+    return base64.b64encode(buffer).decode("ascii")
 
-def _b64_to_cv2(b64: str) -> np.ndarray:
-    data = base64.b64decode(b64)
-    arr = np.frombuffer(data, np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def _b64_to_cv2(value: str) -> np.ndarray:
+    return BoardDetector._decode(base64.b64decode(value, validate=True))
