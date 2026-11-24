@@ -1,0 +1,51 @@
+name: Camera coach checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stockfish
+          python -m pip install -r backend/requirements.txt pytest httpx
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+      - name: Backend and overlay regressions
+        run: |
+          python -m pytest backend/tests -q -p no:cacheprovider
+          npm test
+      - name: Mobile browser and live backend regressions
+        env:
+          CHESS_API_URL: http://127.0.0.1:8080
+          STOCKFISH_PATH: /usr/games/stockfish
+        run: |
+          python backend/tests/generate_camera_fixtures.py
+          python -m uvicorn main:app --app-dir backend --host 127.0.0.1 --port 8080 > /tmp/chess-api.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8080/health; then break; fi
+            sleep 1
+          done
+          npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: camera-ui-screenshots
+          path: .tmp/screens
+          if-no-files-found: ignore
