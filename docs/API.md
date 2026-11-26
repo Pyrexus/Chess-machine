@@ -43,6 +43,7 @@ Analyzes a camera frame or an authoritative FEN within a tracking session.
 | `orientation` | `"auto"` | Color at the bottom of the captured board: `w`, `b`, or `auto`. Automatic inference is most useful at the standard opening setup. |
 | `side_to_move` | `null` | Optional `w` or `b` override when calibrating `setup_fen`; it does not rewrite an ordinary trusted FEN. |
 | `board_corners` | `null` | Four normalized `[x, y]` points in image order: top-left, top-right, bottom-right, bottom-left. |
+| `corners_source` | `"auto"` | `auto` or `tracked` corners are revalidated against the checkerboard; `manual` selects a user-defined region. Manual geometry does not verify a position. |
 | `depth` | `10` | Integer from 4 through 16. Engine search also has a time budget. |
 | `mode` | `"win"` | `win` for stronger advice; `loss` for deliberately weaker choices. |
 | `session_id` | `"default"` | Unique identifier, 1–128 characters. Use a separate identifier for each camera session. |
@@ -107,7 +108,9 @@ All geometry uses the uploaded image coordinate system, normalized to `[0, 1]`. 
 | `game_over` | Checkmate, stalemate, or another automatic game-ending condition. No move is returned. |
 | `engine_error` | Analysis failed. HTTP 503; retry the same position. Failed results do not poison the move cache. |
 
-Detected geometry can be returned even when the position needs setup. `board_locked` requires both a detected board and detected pieces. An empty checkerboard does not produce a move.
+Detected geometry can be returned even when the position needs setup. `board_locked` normally requires a detected board and pieces; a manual region or a temporarily held boundary can also remain locked without a verified position. An empty checkerboard never produces a move.
+
+Camera responses include `position_verified`, `recognition` (`standard_opening`, `setup`, `legal_tracking`, `occupancy`, or `unreadable`), and `quality` (sharpness, contrast, and blur/low-contrast indicators when a board region was read). These measurements are not calibrated recognition probabilities. `lock_state` is `locked`, `held`, `searching`, or `reacquiring`. A held boundary has `geometry_held: true` and `lock_age_ms`, expires after eight seconds without new board evidence, and carries no FEN, move, or overlay. `lock_released: true` tells clients to discard expired corners. Draw advice only for a verified current position, never for a held boundary.
 
 The cache includes piece placement, turn, castling rights, en passant state, the halfmove clock, player color, depth, and mode. Changing those settings triggers fresh advice. Camera tracking advances only from a validated position, and the engine result is checked against its legal moves.
 
@@ -127,7 +130,7 @@ The endpoint returns `ok`, `game_over`, `invalid_fen`, or `engine_error` and the
 
 ## `POST /api/reset-session?session_id=...`
 
-Clears the trusted position, cached result, and request timer for one session:
+Clears the trusted position, cached result, board geometry, orientation, and request timer for one session:
 
 ```json
 {"status": "reset", "session_id": "camera-session"}

@@ -25,11 +25,17 @@ MIN_INTERVAL_SEC = max(0.0, float(os.getenv("MIN_INTERVAL_SEC", "0.5")))
 SESSION_TTL_SEC = 30 * 60
 MAX_SESSIONS = 512
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
+GEOMETRY_HOLD_SEC = 8.0
 
 
 @dataclass
 class CameraSession:
     previous_fen: Optional[str] = None
+    board_corners: Optional[list] = None
+    orientation: Optional[str] = None
+    corners_source: str = "auto"
+    geometry_seen: float = 0.0
+    tracking_failures: int = 0
     cache_key: Optional[tuple] = None
     result: Optional[dict] = None
     last_request: float = 0.0
@@ -48,6 +54,7 @@ class AnalyzeRequest(BaseModel):
     orientation: Literal["w", "b", "auto"] = "auto"
     side_to_move: Optional[Literal["w", "b"]] = None
     board_corners: Optional[list[list[float]]] = None
+    corners_source: Literal["auto", "tracked", "manual"] = "auto"
     depth: int = Field(default=10, ge=4, le=16)
     mode: Literal["win", "loss"] = "win"
     session_id: str = Field(default="default", min_length=1, max_length=128)
@@ -163,24 +170,90 @@ def _overlay(fen: str, uci: Optional[str], corners, orientation: str) -> Optiona
 
 
 def _geometry(detection: Optional[dict], body: AnalyzeRequest) -> dict:
+    camera_read = detection is not None
     detection = detection or {}
     return {
         "board_detected": bool(detection.get("board_detected", detection.get("fen"))),
-        "board_corners": detection.get("board_corners", body.board_corners),
+        # Submitted corners are a hint, not evidence that this frame contains
+        # a board. Only the detector/session may retain them on a camera read.
+        "board_corners": detection.get("board_corners") if camera_read else body.board_corners,
         "orientation": detection.get("orientation", body.orientation if body.orientation != "auto" else "w"),
         "requires_setup": bool(detection.get("requires_setup", False)),
         "piece_count": detection.get("piece_count"),
         "pieces_detected": bool(detection.get("pieces_detected", detection.get("fen"))),
+        "quality": detection.get("quality"),
+        "recognition": detection.get("recognition"),
+        "position_verified": bool(detection.get("fen") and detection.get("position_verified", True)) if camera_read else bool(body.fen),
+        "lock_state": detection.get("lock_state", "locked" if detection.get("board_detected") else "searching"),
+        "geometry_held": bool(detection.get("geometry_held", False)),
+        "corners_source": detection.get("corners_source", body.corners_source),
+        "lock_age_ms": detection.get("lock_age_ms", 0),
+        "lock_released": bool(detection.get("lock_released", False)),
     }
 
 
 def _attach_geometry(result: dict, geometry: dict) -> dict:
     result = {**result, **geometry}
-    result["board_locked"] = bool(result["board_detected"] and result["pieces_detected"] and result["board_corners"])
+    result["board_locked"] = bool(result["board_corners"] and (
+        (result["board_detected"] and result["pieces_detected"]) or result["geometry_held"] or
+        result["corners_source"] == "manual"))
     result["overlay"] = _overlay(
         result["fen"], result.get("move_uci"), result["board_corners"], result["orientation"]
-    ) if result.get("fen") else None
+    ) if result.get("fen") and result["position_verified"] else None
+    logger.info("Camera analysis status=%s locked=%s position_verified=%s confidence=%s recognition=%s",
+                result.get("status"), result["board_locked"], result["position_verified"],
+                result.get("confidence"), result.get("recognition"))
     return result
+
+
+def _remember_geometry(detection: dict, body: AnalyzeRequest, session: CameraSession) -> dict:
+    """A transient unreadable frame must not erase a verified board boundary.
+
+    Held geometry is explicitly marked and never carries a move or verified FEN.
+    It is a short-lived alignment aid while the detector reacquires the board.
+    """
+    now = time.monotonic()
+    if detection.get("board_detected") and detection.get("board_corners"):
+        source = detection.get("corners_source", "manual" if body.board_corners and
+                               body.corners_source == "manual" else session.corners_source)
+        # A detector that rejected manual geometry may have found a different
+        # board automatically. Preserve the provenance of the accepted corners.
+        session.corners_source = source if source in ("auto", "tracked", "manual") else "auto"
+        has_pieces = bool(detection.get("pieces_detected", detection.get("fen")))
+        if has_pieces or session.corners_source == "manual":
+            session.board_corners = detection["board_corners"]
+            session.geometry_seen = now
+            session.tracking_failures = 0
+        else:
+            # An empty checkerboard can be measured, but it must never acquire
+            # a held lock on the following unreadable frame.
+            session.board_corners = None
+            session.geometry_seen = 0.0
+        if detection.get("fen") and detection.get("position_verified", True) and detection.get("orientation") in ("w", "b"):
+            session.orientation = detection["orientation"]
+        detection["corners_source"] = session.corners_source
+        detection["lock_state"] = "locked"
+        detection["geometry_held"] = False
+    else:
+        session.tracking_failures += 1
+        age = now - session.geometry_seen
+        if session.board_corners and age <= GEOMETRY_HOLD_SEC:
+            detection = {**detection, "fen": None, "position_verified": False,
+                         "board_corners": session.board_corners,
+                         "orientation": session.orientation or detection.get("orientation", "w"),
+                         "geometry_held": True, "lock_state": "held",
+                         "corners_source": session.corners_source, "lock_age_ms": round(age * 1000)}
+        else:
+            session.board_corners = None
+            session.orientation = None
+            session.corners_source = "auto"
+            detection["board_corners"] = None
+            detection["fen"] = None
+            detection["position_verified"] = False
+            detection["corners_source"] = "auto"
+            detection["lock_state"] = "reacquiring" if session.previous_fen else "searching"
+            detection["lock_released"] = True
+    return detection
 
 
 async def _engine_result(sf, fen: str, depth: int, mode: str, confidence: float) -> dict:
@@ -249,21 +322,29 @@ async def analyze(request: Request, body: AnalyzeRequest):
                 valid, error = validate_fen(setup_fen)
                 if not valid:
                     return JSONResponse({"status": "invalid_fen", "message": error}, status_code=400)
+            supplied_corners = body.board_corners or session.board_corners
+            source = (body.corners_source if body.board_corners else
+                      "manual" if session.board_corners and session.corners_source == "manual" else
+                      "tracked" if session.board_corners else "auto")
             try:
                 detection = await run_in_threadpool(
                     request.app.state.detector.detect, image, player_color=body.player_color,
-                    orientation=body.orientation, previous_fen=session.previous_fen,
-                    setup_fen=setup_fen, board_corners=body.board_corners,
+                    orientation=body.orientation,
+                    previous_fen=session.previous_fen, setup_fen=setup_fen,
+                    side_to_move=body.side_to_move,
+                    board_corners=supplied_corners, corners_source=source,
                 )
             except Exception:
                 logger.exception("Board detector failed")
-                return JSONResponse({"status": "detection_error", "message": "Could not read this frame. Keep the full board visible.",
-                                     "confidence": 0.0, "board_detected": False, "board_locked": False, "overlay": None})
+                detection = {"status": "detection_error", "error": "Could not read this frame. Keep the full board visible.",
+                             "confidence": 0.0, "board_detected": False, "fen": None}
+            detection = _remember_geometry(detection, body, session)
             confidence = detection.get("confidence", 0.0)
             geometry = _geometry(detection, body)
-            if detection.get("error") or not detection.get("fen"):
+            if detection.get("error") or not geometry["position_verified"]:
                 return _attach_geometry({
-                    "status": detection.get("status", "detection_error"),
+                    "status": ("position_uncertain" if detection.get("status") in ("ok", "no_change") else
+                               detection.get("status", "detection_error")),
                     "message": detection.get("error") or "Set the current position to start tracking.",
                     "confidence": confidence, "fen": None, "move_uci": None, "move_human": None,
                 }, geometry)
@@ -271,6 +352,7 @@ async def analyze(request: Request, body: AnalyzeRequest):
         geometry = _geometry(detection, body)
         valid, error = validate_fen(fen)
         if not valid:
+            geometry["position_verified"] = False
             return JSONResponse(_attach_geometry({"status": "invalid_fen" if body.fen else "detection_error",
                                                  "message": error, "confidence": confidence, "fen": None}, geometry),
                                 status_code=400 if body.fen else 200)
@@ -315,5 +397,9 @@ async def reset_session(session_id: str = "default"):
     if session:
         async with session.lock:
             session.previous_fen = session.cache_key = session.result = None
+            session.board_corners = session.orientation = None
+            session.corners_source = "auto"
+            session.geometry_seen = 0.0
+            session.tracking_failures = 0
             session.last_request = 0.0
     return {"status": "reset", "session_id": session_id}

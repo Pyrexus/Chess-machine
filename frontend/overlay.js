@@ -5,6 +5,23 @@ export function fitInside(width, height, size = 1000) {
   return { x: (size - w) / 2, y: (size - h) / 2, width: w, height: h };
 }
 
+/** Relative focus score for choosing the clearest frame in a short burst. */
+export function frameDetailScore(pixels, width, height) {
+  if (!pixels || width < 3 || height < 3) return 0;
+  let energy = 0, count = 0;
+  // Only compare frames from the same camera view. Absolute thresholds vary
+  // with the chess set, lighting and screen texture and must not block scans.
+  const gray = index => .299 * pixels[index] + .587 * pixels[index + 1] + .114 * pixels[index + 2];
+  for (let y = 1; y < height - 1; y += 2) for (let x = 1; x < width - 1; x += 2) {
+    const index = (y * width + x) * 4;
+    const center = gray(index);
+    const laplacian = 4 * center - gray(index - 4) - gray(index + 4)
+      - gray(index - width * 4) - gray(index + width * 4);
+    energy += laplacian * laplacian; count++;
+  }
+  return count ? energy / count : 0;
+}
+
 // Project unit board coordinates into the actual camera quadrilateral. A
 // bilinear interpolation is insufficient for a tilted/perspective board.
 export function projectPoint(corners, x, y) {

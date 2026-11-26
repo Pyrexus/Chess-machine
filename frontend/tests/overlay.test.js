@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fitInside, projectPoint, moveGeometry, validCorners, resolveApiBase } from "../overlay.js";
+import { fitInside, projectPoint, moveGeometry, validCorners, resolveApiBase, frameDetailScore } from "../overlay.js";
 
 test("landscape and portrait camera fit matches the square capture letterbox", () => {
   assert.deepEqual(fitInside(1920, 1080), { x: 0, y: 218.75, width: 1000, height: 562.5 });
@@ -40,4 +40,19 @@ test("Railway and local apps use their own API; Pages and overrides resolve safe
   assert.equal(resolveApiBase({ origin: "https://chess.pages.dev", fallback }), fallback);
   assert.equal(resolveApiBase({ origin: "https://chess.pages.dev", search: "?api=https://other.example/", fallback }), "https://other.example");
   assert.throws(() => resolveApiBase({ origin: "https://chess.pages.dev", stored: "javascript:bad", fallback }));
+});
+
+test("burst selection favors detailed camera frames without rejecting flat frames", () => {
+  const width = 16, height = 16, sharp = new Uint8ClampedArray(width * height * 4), flat = sharp.slice();
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const index = (y * width + x) * 4;
+    for (let c = 0; c < 3; c++) {
+      flat[index + c] = 128;
+      sharp[index + c] = (x + y) % 2 ? 240 : 20;
+    }
+    flat[index + 3] = sharp[index + 3] = 255;
+  }
+  assert.ok(frameDetailScore(flat, width, height) < 1e-10);
+  assert.ok(frameDetailScore(sharp, width, height) > 1000);
+  assert.equal(frameDetailScore(flat, 1, 1), 0);
 });
