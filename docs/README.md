@@ -28,9 +28,9 @@ The vision pipeline does not independently identify arbitrary midgame pieces. It
 
 ## Board alignment
 
-Automatic alignment verifies the board pattern instead of treating any rectangle as a chessboard. When automatic alignment is difficult, select **Set corners** and tap the board's top-left, top-right, bottom-right, then bottom-left corner. Crossed or degenerate corners are rejected. **Unlock** clears the calibration and scans again.
+Automatic alignment verifies the board pattern instead of treating any rectangle as a chessboard. When automatic alignment is difficult, select **Set corners** and tap the board's top-left, top-right, bottom-right, then bottom-left corner. Crossed or degenerate corners are rejected. A manual region helps alignment but does not identify unreadable pieces. **Unlock** clears the calibration and scans again.
 
-Orientation describes the camera view, independently of whose turn it is or which color you play. Turning the camera to the opposite side requires changing the orientation and recalibrating. A partial board, glare, low contrast, or a hand over pieces can cause the app to withhold a suggestion until a readable frame returns.
+Orientation describes the camera view, independently of whose turn it is or which color you play. Automatic orientation can follow a 180-degree board rotation; a fixed orientation must be changed when switching sides. Use **Whose turn is it?** to correct the active side when necessary. A partial board, severe blur, glare, or a hand over pieces can cause the app to withhold a suggestion until a readable frame returns. During temporary refocusing it keeps a dashed outline for up to eight seconds and hides the previous arrow; after that it releases the lock and searches again.
 
 ## Local development
 

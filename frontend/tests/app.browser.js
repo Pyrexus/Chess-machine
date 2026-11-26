@@ -141,6 +141,53 @@ test("a stopped camera cannot display an in-flight result or reopen after delaye
   assert.deepEqual(delayed.errors, []); await delayed.close();
 });
 
+test("stopping during burst capture cancels the frame before a request is sent", async () => {
+  const page = await newPage(); await fakeCamera(page); let requests = 0;
+  await page.addInitScript(() => {
+    const encode = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function (...args) {
+      const result = encode.apply(this, args);
+      if (this.id === "captureCanvas" && !window.stoppedDuringBurst) {
+        window.stoppedDuringBurst = true;
+        queueMicrotask(() => document.getElementById("btnStop").click());
+      }
+      return result;
+    };
+  });
+  await page.route("**/api/analyze", route => { requests++; return respond(route); });
+  await page.goto(origin); await page.locator("#btnStart").click();
+  await page.waitForFunction(() => window.stoppedDuringBurst);
+  await page.waitForTimeout(300);
+  assert.equal(requests, 0);
+  assert.equal(await page.locator("#cameraFeed").isVisible(), false);
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  assert.equal(await page.locator("#btnStart").isEnabled(), true);
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
+test("an unverified success cannot consume setup or replace the active position", async () => {
+  const page = await newPage(); const bodies = [];
+  await page.route("**/api/analyze", route => {
+    const body = route.request().postDataJSON(); bodies.push(body);
+    return respond(route, bodies.length === 1 ? advice : {
+      ...advice, status: "opponent_turn", turn: "b", position_verified: false,
+      message: "Confirming the setup.",
+    });
+  });
+  await page.goto(origin); await photo(page); await page.locator("#moveResult").waitFor();
+  await page.locator("#setupPanel").evaluate(el => { el.open = true; });
+  await page.locator("#customFenInput").fill(startFen);
+  await page.locator("#btnSetPosition").click();
+  await page.locator("#statusMsg").filter({ hasText: "Confirming the setup." }).waitFor();
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  assert.equal(await page.locator("#turnSelect").inputValue(), "w");
+  await page.locator("#depthSlider").evaluate(el => { el.value = "12"; el.dispatchEvent(new Event("input")); el.dispatchEvent(new Event("change")); });
+  await page.waitForFunction(() => document.getElementById("btnSetPosition").disabled === false);
+  assert.ok(bodies.length >= 3);
+  assert.equal(bodies[2].setup_fen, startFen);
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
 test("unclear position removes stale arrows while retaining the detected board lock", async () => {
   const page = await newPage(); let requests = 0;
   await page.route("**/api/analyze", route => respond(route, ++requests === 1 ? advice :
@@ -151,6 +198,89 @@ test("unclear position removes stale arrows while retaining the detected board l
   assert.equal(await page.locator("#moveOverlay line").count(), 0);
   assert.equal(await page.locator("#moveOverlay polygon").count(), 1);
   assert.equal(await page.locator("#moveResult").isVisible(), false);
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
+test("blur preserves a measured board outline while suppressing unverified advice", async () => {
+  const page = await newPage(); await fakeCamera(page); let requests = 0;
+  await page.route("**/api/analyze", route => {
+    const data = ++requests === 1 ? advice : requests === 2 ?
+      { status: "detection_error", board_detected: false, pieces_detected: false,
+        board_locked: false, board_corners: null, message: "Camera is refocusing." } :
+      { ...advice, status: "no_change", geometry_held: true, message: "Reading pieces." };
+    return respond(route, data);
+  });
+  await page.goto(origin); await page.locator("#btnStart").click(); await page.locator("#moveResult").waitFor();
+  await page.locator("#statusMsg").filter({ hasText: "Camera is refocusing." }).waitFor();
+  assert.equal(await page.locator("#moveOverlay polygon").count(), 1);
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  assert.equal(await page.locator("#boardStatus").textContent(), "Board held · refocusing");
+  await page.locator("#statusMsg").filter({ hasText: "Reading pieces." }).waitFor();
+  assert.equal(await page.locator("#moveResult").isVisible(), false);
+  assert.equal(await page.locator("#moveOverlay polygon").count(), 1);
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  await page.locator("#btnStop").click();
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
+test("manual corner selection survives unreadable pieces and is submitted as manual geometry", async () => {
+  const page = await newPage(); const bodies = [];
+  await page.route("**/api/analyze", route => {
+    const body = route.request().postDataJSON(); bodies.push(body);
+    return respond(route, bodies.length === 1 ?
+      { status: "detection_error", board_detected: false, board_corners: null, message: "Set the board corners." } :
+      { status: "position_uncertain", board_detected: true, board_locked: true, pieces_detected: false,
+        board_corners: body.board_corners, corners_source: "manual", message: "Reading pieces within your corners." });
+  });
+  await page.goto(origin); await photo(page);
+  await page.locator("#statusMsg").filter({ hasText: "Set the board corners." }).waitFor();
+  await page.locator("#btnLockBoard").click();
+  const frame = page.locator("#cameraFrame");
+  const box = await frame.boundingBox();
+  for (const [x, y] of [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]) await frame.click({ position: { x: box.width * x, y: box.height * y } });
+  await page.locator("#statusMsg").filter({ hasText: "Reading pieces within your corners." }).waitFor();
+  assert.equal(bodies[1].corners_source, "manual");
+  assert.equal(bodies[1].board_corners.length, 4);
+  assert.equal(await page.locator("#moveOverlay polygon").count(), 1);
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  assert.equal(await page.locator("#boardStatus").textContent(), "Board locked · reading pieces");
+  const encoded = Buffer.from(bodies[0].image_b64, "base64");
+  assert.ok(encoded.length > 0);
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
+test("server-held geometry refocuses and an expired lock removes the outline", async () => {
+  const page = await newPage(); await fakeCamera(page); let requests = 0;
+  await page.route("**/api/analyze", route => respond(route, ++requests === 1 ? advice : requests === 2 ?
+    { ...advice, status: "detection_error", fen: null, move_uci: null, board_detected: false,
+      position_verified: false, geometry_held: true, lock_state: "held", message: "Holding the board boundary." } :
+    { status: "detection_error", board_corners: null, board_locked: false, board_detected: false,
+      position_verified: false, lock_state: "reacquiring", message: "Find the board again." }));
+  await page.goto(origin); await page.locator("#btnStart").click(); await page.locator("#moveResult").waitFor();
+  await page.locator("#statusMsg").filter({ hasText: "Holding the board boundary." }).waitFor();
+  assert.equal(await page.locator("#boardStatus").textContent(), "Board held · refocusing");
+  assert.equal(await page.locator("#moveOverlay polygon").count(), 1);
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
+  await page.locator("#statusMsg").filter({ hasText: "Find the board again." }).waitFor();
+  assert.equal(await page.locator("#moveOverlay polygon").count(), 0);
+  assert.equal(await page.locator("#boardStatus").textContent(), "Looking for board");
+  await page.locator("#btnStop").click();
+  assert.deepEqual(page.errors, []); await page.close();
+});
+
+test("side-to-move selection reaches image recognition and can correct a detected position", async () => {
+  const page = await newPage(); const bodies = [];
+  await page.route("**/api/analyze", route => {
+    bodies.push(route.request().postDataJSON());
+    return respond(route, bodies.length === 1 ? advice : { ...advice, status: "opponent_turn", turn: "b", move_uci: null });
+  });
+  await page.goto(origin); await photo(page); await page.locator("#moveResult").waitFor();
+  assert.equal(bodies[0].side_to_move, "w");
+  await page.locator("#turnSelect").selectOption("b");
+  await page.locator("#waitText").filter({ hasText: "Opponent’s turn" }).waitFor();
+  assert.equal(bodies[1].side_to_move, "b");
+  assert.equal(bodies[1].setup_fen.split(" ")[1], "b");
+  assert.equal(await page.locator("#moveOverlay line").count(), 0);
   assert.deepEqual(page.errors, []); await page.close();
 });
 

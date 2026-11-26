@@ -1,4 +1,4 @@
-import { fitInside, moveGeometry, validCorners, resolveApiBase } from "./overlay.js";
+import { fitInside, moveGeometry, validCorners, resolveApiBase, frameDetailScore } from "./overlay.js";
 
 const DEFAULT_API = "https://backend-production-e51676e6.up.railway.app";
 const STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -6,7 +6,7 @@ const $ = id => document.getElementById(id);
 const state = {
   running: false, starting: false, source: null, facing: "environment", timer: null,
   generation: 0, controller: null, session: crypto.randomUUID(), corners: null,
-  cameraAttempt: 0,
+  cameraAttempt: 0, cornersSource: "auto", lockReading: false,
   manualCorners: [], locking: false, move: null, fen: null, setupFen: null,
   player: "w", orientation: "auto", resolvedOrientation: "w", depth: 10, mode: "win", busy: false,
 };
@@ -56,7 +56,8 @@ function resetTracking({ keepCorners = false } = {}) {
   state.fen = null;
   state.setupFen = null;
   state.resolvedOrientation = state.orientation === "b" ? "b" : "w";
-  if (!keepCorners) state.corners = null;
+  if (!keepCorners) { state.corners = null; state.cornersSource = "auto"; }
+  state.lockReading = false;
   state.manualCorners = [];
   state.locking = false;
   $("boardStatus").textContent = state.corners ? "Board locked" : "Looking for board";
@@ -77,6 +78,8 @@ function stopCamera({ clear = true } = {}) {
   if (clear) {
     state.source = null;
     state.corners = null;
+    state.cornersSource = "auto";
+    state.lockReading = false;
     state.locking = false;
     $("photoPreview").hidden = true;
     $("cameraOverlay").hidden = false;
@@ -100,7 +103,16 @@ async function startCamera() {
   updateControls(); setStatus("Opening camera…");
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: false,
-      video: { facingMode: { ideal: state.facing }, width: { ideal: 1280 }, height: { ideal: 1280 } } });
+      video: { facingMode: { ideal: state.facing }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 24 } } });
+    if (attempt !== state.cameraAttempt) { stream.getTracks().forEach(t => t.stop()); return; }
+    // Supported phones keep refocusing as the board or camera moves. Treat
+    // these as best-effort hints; unsupported cameras still start normally.
+    const track = stream.getVideoTracks()[0];
+    const capabilities = track?.getCapabilities?.() || {};
+    const continuous = {};
+    if (capabilities.focusMode?.includes("continuous")) continuous.focusMode = "continuous";
+    if (capabilities.exposureMode?.includes("continuous")) continuous.exposureMode = "continuous";
+    if (Object.keys(continuous).length) await track.applyConstraints({ advanced: [continuous] }).catch(() => {});
     if (attempt !== state.cameraAttempt) { stream.getTracks().forEach(t => t.stop()); return; }
     $("cameraFeed").srcObject = stream;
     await $("cameraFeed").play();
@@ -124,19 +136,31 @@ async function startCamera() {
   } finally { if (attempt === state.cameraAttempt) state.starting = false; updateControls(); }
 }
 
-function captureFrame() {
+async function captureFrame(generation) {
   const source = state.source === "camera" ? $("cameraFeed") : $("photoPreview");
   const width = source.videoWidth || source.naturalWidth, height = source.videoHeight || source.naturalHeight;
   if (!width || !height) return null;
-  const canvas = $("captureCanvas"), size = 720;
+  const canvas = $("captureCanvas"), size = state.source === "camera" ? 960 : 1280;
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d"), fit = fitInside(width, height, size);
-  ctx.fillStyle = "#182923"; ctx.fillRect(0, 0, size, size);
-  ctx.drawImage(source, fit.x, fit.y, fit.width, fit.height);
-  return canvas.toDataURL("image/jpeg", .9).split(",")[1];
+  const samples = state.source === "camera" ? 3 : 1;
+  const probe = document.createElement("canvas"); probe.width = probe.height = 192;
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  let bestImage = null, bestScore = -1;
+  for (let sample = 0; sample < samples; sample++) {
+    if (generation !== state.generation) return null;
+    ctx.fillStyle = "#182923"; ctx.fillRect(0, 0, size, size);
+    ctx.drawImage(source, fit.x, fit.y, fit.width, fit.height);
+    // Ignore the square frame's letterbox when measuring camera sharpness.
+    probeCtx.drawImage(source, 0, 0, 192, 192);
+    const score = frameDetailScore(probeCtx.getImageData(0, 0, 192, 192).data, 192, 192);
+    if (score > bestScore) { bestScore = score; bestImage = canvas.toDataURL("image/jpeg", .94).split(",")[1]; }
+    if (sample + 1 < samples) await new Promise(resolve => setTimeout(resolve, 75));
+  }
+  return bestImage;
 }
 
-function schedule(delay = 1250) {
+function schedule(delay = 850) {
   clearTimeout(state.timer);
   if (state.running && !state.locking && !document.hidden) state.timer = setTimeout(scanFrame, delay);
 }
@@ -164,21 +188,24 @@ async function apiRequest(path, body, generation) {
 
 async function scanFrame() {
   if (state.busy || state.locking || !state.source || state.source === "demo") { schedule(); return; }
-  const b64 = captureFrame();
-  if (!b64) { schedule(250); return; }
   const generation = state.generation, setupFen = state.setupFen;
   state.busy = true; updateControls();
   const t0 = performance.now();
   try {
+    const b64 = await captureFrame(generation);
+    if (!b64 || generation !== state.generation) return;
     const data = await apiRequest("/api/analyze", {
       image_b64: b64, player_color: state.player, orientation: state.orientation,
+      side_to_move: $("turnSelect").value,
       depth: state.depth, mode: state.mode, session_id: state.session,
-      ...(state.corners ? { board_corners: state.corners } : {}),
+      ...(state.corners ? { board_corners: state.corners, corners_source: state.cornersSource } : {}),
       ...(setupFen ? { setup_fen: setupFen } : {}),
     }, generation);
     if (data) {
       handleResponse(data, Math.round(performance.now() - t0));
-      if (["ok", "no_change", "opponent_turn", "game_over"].includes(data.status) && state.setupFen === setupFen) state.setupFen = null;
+      if (data.position_verified !== false && !data.geometry_held && data.fen
+        && ["ok", "no_change", "opponent_turn", "game_over"].includes(data.status)
+        && state.setupFen === setupFen) state.setupFen = null;
     }
   } catch (err) {
     if (generation === state.generation) { clearMove("Connection interrupted. Retrying…"); setStatus(err.message, "error"); }
@@ -189,17 +216,38 @@ async function scanFrame() {
 
 function handleResponse(data, elapsed) {
   const hasPieces = data.pieces_detected !== false;
+  const goodCorners = validCorners(data.board_corners);
+  const emptyBoard = data.board_detected === true && !hasPieces && data.status === "setup_required"
+    && data.corners_source !== "manual" && !data.geometry_held;
+  const released = data.lock_released === true || (data.board_locked === false && !goodCorners
+    && ["searching", "reacquiring"].includes(data.lock_state));
+  const readingPosition = ["detection_error", "position_uncertain", "tracking_error", "tracking_lost", "recognition_error", "image_blurry", "reacquiring", "recognizing", "reading_position"].includes(data.status)
+    || data.position_verified === false || data.geometry_held === true;
   if (["w", "b"].includes(data.orientation)) state.resolvedOrientation = data.orientation;
-  if (!hasPieces) {
+  if (released || emptyBoard) {
     state.corners = null;
-    $("boardStatus").textContent = "Board found · add pieces";
+    state.cornersSource = "auto";
+    $("boardStatus").textContent = emptyBoard ? "Board found · add pieces" : "Looking for board";
     $("confBadge").hidden = true;
   }
-  if (hasPieces && validCorners(data.board_corners)) {
+  if (goodCorners && !emptyBoard && !released) {
     state.corners = data.board_corners;
-    $("boardStatus").textContent = "Board locked";
-    $("confBadge").textContent = `${Math.round((data.confidence || 0) * 100)}% confidence`;
+    if (["manual", "auto", "tracked"].includes(data.corners_source)) state.cornersSource = data.corners_source;
+    $("boardStatus").textContent = data.geometry_held ? "Board held · refocusing" : readingPosition ? "Board locked · reading pieces" : "Board locked";
+    $("confBadge").textContent = data.geometry_held ? "Reading a clearer frame" : `${Math.round((data.confidence || 0) * 100)}% confidence`;
     $("confBadge").hidden = false;
+  } else if (state.corners && readingPosition) {
+    // A noisy frame must not throw away a previously measured board boundary.
+    // Retain it as a held outline; advice remains hidden until pieces are read.
+    $("boardStatus").textContent = "Board held · refocusing";
+    $("confBadge").textContent = "Reading a clearer frame";
+    $("confBadge").hidden = false;
+  }
+  state.lockReading = Boolean(state.corners && readingPosition);
+  if (readingPosition && ["ok", "no_change", "opponent_turn", "game_over"].includes(data.status)) {
+    clearMove("Board locked. Reading the position before suggesting a move…");
+    setStatus(data.message || "Waiting for a clear, verified position.");
+    updateControls(); drawOverlay(); return;
   }
   if (data.fen && ["ok", "no_change", "opponent_turn", "game_over"].includes(data.status)) {
     state.fen = data.fen;
@@ -238,13 +286,18 @@ function handleResponse(data, elapsed) {
     case "position_uncertain":
     case "tracking_error":
     case "tracking_lost":
-      if (!data.board_detected && !data.board_locked) {
-        state.corners = null;
-        $("boardStatus").textContent = "Looking for board";
-        $("confBadge").hidden = true;
-      }
-      clearMove("Keep the board steady and your hands clear. Scanning again…");
+    case "recognition_error":
+    case "image_blurry":
+    case "reacquiring":
+    case "recognizing":
+    case "reading_position":
+      if (!state.corners) $("boardStatus").textContent = "Looking for board";
+      clearMove(state.corners ? "Board held. Reading a clearer frame before showing the next move…" : "Keep the full board visible. Looking for its four corners…");
       setStatus(data.message || "Could not read this frame. Scanning again…"); break;
+    case "engine_starting":
+    case "model_loading":
+      clearMove("The board reader is starting. Analysis will resume automatically…");
+      setStatus(data.message || "Preparing the board reader. Please keep the camera steady."); break;
     default:
       clearMove(data.message || "Could not analyze this position.");
       setStatus(data.message || "Analysis failed. Check the position and try again.", "error");
@@ -271,6 +324,7 @@ function drawOverlay() {
   }
   if (!state.corners) return;
   add("polygon", { points: points(state.corners), fill: "none", stroke: "#c3f578", "stroke-width": 3, "stroke-linejoin": "round", opacity: .85 });
+  if (state.lockReading) svg.lastElementChild.setAttribute("stroke-dasharray", "12 8");
   state.corners.forEach(([x, y]) => add("circle", { cx: x * 1000, cy: y * 1000, r: 6, fill: "#c3f578" }));
   if (!state.move) return;
   const geometry = moveGeometry(state.move, state.corners, state.resolvedOrientation);
@@ -318,7 +372,7 @@ $("cameraFrame").addEventListener("click", event => {
   if (state.manualCorners.length === 4) {
     if (!validCorners(state.manualCorners)) { state.manualCorners = []; setStatus("Those corners crossed. Tap top-left, top-right, bottom-right, bottom-left.", "error"); }
     else {
-      state.corners = state.manualCorners; state.locking = false;
+      state.corners = state.manualCorners; state.cornersSource = "manual"; state.locking = false;
       $("boardStatus").textContent = "Board locked"; setStatus("Board corners set. Reading the position…"); scanFrame();
     }
   }
@@ -421,6 +475,18 @@ $("orientationSelect").addEventListener("change", () => {
   state.resolvedOrientation = state.orientation === "b" ? "b" : "w";
   if (state.source === "demo" && state.fen) { drawDemoBoard(state.fen); drawOverlay(); }
   else { resetTracking(); if (state.source) scanFrame(); }
+});
+$("turnSelect").addEventListener("change", () => {
+  const selected = $("turnSelect").value;
+  if (state.fen) {
+    const fields = state.fen.split(/\s+/); fields[1] = selected;
+    // A user correcting the active side intentionally starts a fresh read.
+    // Image recognition cannot recover whose turn it is from pixels alone.
+    if (state.source === "demo") { analyzeFen(fields.join(" ")); return; }
+    const fen = fields.join(" ");
+    resetTracking({ keepCorners: true }); state.setupFen = fen;
+  }
+  refreshAnalysis("Updating the side to move…");
 });
 for (const [id, property, message] of [["colorToggle", "player", "Updating your playing color…"], ["modeToggle", "mode", "Updating analysis…"]]) {
   $(id).querySelectorAll("button").forEach(button => button.addEventListener("click", () => {

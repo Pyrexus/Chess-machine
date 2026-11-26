@@ -4,9 +4,9 @@ The application favors prompt, bounded analysis and reliable state transitions. 
 
 ## Camera and network
 
-The frontend captures a 720-by-720 JPEG at quality `0.9`. The complete native camera frame is scaled to fit and letterboxed, so a landscape or portrait source keeps all visible board corners. The square view and captured image use the same alignment.
+The frontend captures a 960-by-960 camera JPEG or a 1280-by-1280 uploaded photo at quality `0.94`. For a camera scan it samples three frames 75 ms apart and sends the one with the most detail. Continuous focus and exposure are requested when the camera supports them. The complete native camera frame is scaled to fit and letterboxed, so a landscape or portrait source keeps all visible board corners. The square view and captured image use the same alignment.
 
-Camera scans are scheduled after the preceding request completes, with a 1.25-second interval. This prevents overlapping requests from building a backlog. Requests time out after 15 seconds, and a generation check discards responses from an old camera, photo, or settings state.
+Camera scans are scheduled after the preceding request completes, with an 850 ms interval. Burst capture and processing add to this interval. This prevents overlapping requests from building a backlog. Requests time out after 15 seconds, and generation checks cancel unfinished captures and discard responses from an old camera, photo, or settings state.
 
 The previous partial-image hash shortcut has been removed. Hashing a JPEG prefix can miss changed squares; every scheduled frame now reaches detection. An unchanged validated position still avoids an engine search through the server's result cache.
 
@@ -14,7 +14,9 @@ Scanning pauses when the tab is hidden. Camera tracks are stopped when the user 
 
 ## Vision
 
-The detector limits incoming images to a maximum dimension of 960 pixels and warps a verified board to 480-by-480 for square measurements. It checks an 8-by-8 alternating pattern before accepting a candidate rectangle and uses adaptive foreground/color measurements for occupancy.
+The detector limits incoming images to a maximum dimension of 960 pixels and warps a verified board to 480-by-480 for square measurements. It checks an 8-by-8 alternating pattern before accepting an automatic candidate, using contours, line intersections, or internal grid corners. Spatial illumination and contrast estimates accommodate uneven lighting; central foreground measurements reduce false pieces caused by blurred square edges.
+
+A measured board boundary can be held for up to eight seconds after detection fails. Held outlines are marked as refocusing and never justify a move suggestion. The server releases expired geometry even when the client keeps submitting old corners. Manual corners describe a user-selected region and do not prove that its pieces have been read.
 
 This pipeline has no learned piece-type model. Its valid operating path is:
 
@@ -23,7 +25,7 @@ This pipeline has no learned piece-type model. Its valid operating path is:
 3. Match an unchanged position, one legal move, or two consecutive legal moves.
 4. Keep the position uncommitted when no unique match exists.
 
-Clear overhead views and visible square backgrounds work best. Glare, shadows, similar piece and board colors, hands over squares, partial boards, and missed move sequences can prevent a unique result. Different promotions can have the same occupancy and require explicit position confirmation.
+Clear overhead views and visible square backgrounds work best. Moderate synthetic blur, low contrast, and uneven lighting have regression coverage; this does not guarantee all real camera conditions. Severe blur, glare, similar piece and board colors, hands over squares, partial boards, and missed move sequences can prevent a unique result. Different promotions can have the same occupancy and require explicit position confirmation.
 
 Automatic starting calibration assumes that a matching starting occupancy contains the normal starting piece arrangement. Same-color piece types cannot be distinguished from occupancy alone.
 
