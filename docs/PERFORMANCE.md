@@ -35,6 +35,8 @@ Stockfish is kept in a persistent UCI process with one thread and a 32 MB hash t
 
 Stockfish search uses both the selected depth and a 350 ms search budget. Weaker mode can perform an additional short candidate analysis. Process startup, UCI communication, detection, queueing, and network time are additional overhead; the search budget is not a whole-request latency guarantee.
 
+Cold engine initialization allows up to 15 seconds to load the embedded neural network and confirm readiness. Once initialized, ordinary engine operations use a three-second timeout. This avoids permanently switching a slow-starting container to the fallback engine.
+
 When Stockfish cannot run, the Python evaluator performs a shallower search with a 300 ms target budget and returns legal advice. Responses label this fallback and omit an Elo estimate. Its recommendations should not be treated as Stockfish strength.
 
 ## Sessions and caching

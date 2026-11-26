@@ -1,6 +1,7 @@
 import pytest
 import chess
 import time
+import sys
 from services.stockfish_service import (
     StockfishService,
     validate_fen,
@@ -44,6 +45,38 @@ def test_stockfish_service_startup_resilience():
     sf.start()
     assert sf.is_ready
     sf.stop()
+
+
+def test_cold_uci_engine_can_initialize_after_three_seconds(tmp_path, monkeypatch):
+    engine_script = tmp_path / "cold_engine.py"
+    engine_script.write_text('''
+import sys
+import time
+for line in sys.stdin:
+    command = line.strip()
+    if command == "uci":
+        time.sleep(3.2)
+        print("id name Cold test engine")
+        print("option name Threads type spin default 1 min 1 max 128")
+        print("option name Hash type spin default 16 min 1 max 256")
+        print("uciok", flush=True)
+    elif command == "isready":
+        print("readyok", flush=True)
+    elif command.startswith("go"):
+        print("bestmove e2e4", flush=True)
+    elif command == "quit":
+        break
+''', encoding="utf-8")
+    monkeypatch.setattr("services.stockfish_service._resolve_path",
+                        lambda: [sys.executable, "-u", str(engine_script)])
+    sf = StockfishService()
+    try:
+        sf.start()
+        assert sf.is_ready and not sf.is_fallback
+        result = sf.get_best_move(chess.STARTING_FEN)
+        assert result["engine"] == "stockfish" and result["uci"] == "e2e4"
+    finally:
+        sf.stop()
 
 def test_fallback_engine_eval():
     fb = PythonFallbackEngine()
