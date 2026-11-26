@@ -1,8 +1,11 @@
+import base64
+
 import pytest
 import chess
 from fastapi.testclient import TestClient
 from main import app
 from routers import analysis
+from .test_board_detector import board_image, encode
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +36,18 @@ def test_depth_info(client):
     assert len(data["depths"]) == 13
 
 def test_reset_session(client):
+    session = analysis._session("test_reset")
+    session.board_corners = [[0, 0], [1, 0], [1, 1], [0, 1]]
+    session.orientation = "b"
+    session.corners_source = "manual"
+    session.geometry_seen = analysis.time.monotonic()
+    session.previous_fen = chess.STARTING_FEN
     res = client.post("/api/reset-session?session_id=test_reset")
     assert res.status_code == 200
     assert res.json() == {"status": "reset", "session_id": "test_reset"}
+    assert session.board_corners is None and session.orientation is None
+    assert session.previous_fen is None and session.corners_source == "auto"
+    assert session.geometry_seen == 0
 
 def test_analyze_fen_valid(client):
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -200,6 +212,36 @@ def test_camera_geometry_and_previous_position_passed_to_detector(client, monkey
     assert chess.Move.from_uci(third["move_uci"]) in board.legal_moves
 
 
+def test_real_camera_reader_accepts_the_api_contract(client):
+    # Exercise the real detector through HTTP: mocks accepting **kwargs would
+    # hide a disagreement between router arguments and the detector signature.
+    image = base64.b64encode(encode(board_image())).decode("ascii")
+    result = client.post("/api/analyze", json={
+        "image_b64": image, "session_id": "real_camera", "orientation": "auto",
+    }).json()
+    assert result["status"] == "ok", result
+    assert result["fen"] == chess.STARTING_FEN
+    assert result["position_verified"] and result["board_locked"]
+    assert result["move_uci"] and result["overlay"]["from"]
+    assert result["quality"] is not None and result["recognition"]
+
+
+def test_playing_color_is_not_used_as_a_turn_override(client, monkeypatch):
+    calls = []
+
+    def detect(*args, **kwargs):
+        calls.append(kwargs)
+        return {"fen": chess.STARTING_FEN, "status": "ok", "board_detected": True,
+                "board_corners": [[0, 0], [1, 0], [1, 1], [0, 1]], "orientation": "w"}
+
+    monkeypatch.setattr(app.state.detector, "detect", detect)
+    result = client.post("/api/analyze", json={
+        "image_b64": "ZmFrZQ==", "player_color": "b", "session_id": "black_player",
+    }).json()
+    assert calls[0]["side_to_move"] is None
+    assert result["turn"] == "w" and result["status"] == "opponent_turn"
+
+
 def test_unknown_camera_position_returns_setup_with_geometry(client, monkeypatch):
     corners = [[0, 0], [1, 0], [1, 1], [0, 1]]
     monkeypatch.setattr(app.state.detector, "detect", lambda *args, **kwargs: {
@@ -288,3 +330,101 @@ def test_empty_detected_board_does_not_lock_or_suggest_a_move(client, monkeypatc
     result = client.post("/api/analyze", json={"image_b64": "ZmFrZQ==", "session_id": "empty_board"}).json()
     assert result["board_detected"] and not result["board_locked"]
     assert result["move_uci"] is None and result["overlay"] is None
+
+
+def test_camera_lock_survives_blurred_frame_without_reusing_stale_move(client, monkeypatch):
+    corners = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]
+    calls = []
+    def detect(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            return {"fen": None, "error": "Camera is blurred.", "status": "detection_error",
+                    "board_detected": False, "pieces_detected": False, "confidence": 0.1}
+        return {"fen": chess.STARTING_FEN, "error": None, "status": "ok", "confidence": 0.9,
+                "board_detected": True, "board_corners": corners, "orientation": "b", "pieces_detected": True}
+    monkeypatch.setattr(app.state.detector, "detect", detect)
+    body = {"image_b64": "ZmFrZQ==", "session_id": "blur_lock", "orientation": "auto"}
+    first = client.post("/api/analyze", json=body).json()
+    blurred = client.post("/api/analyze", json=body).json()
+    recovered = client.post("/api/analyze", json=body).json()
+    assert first["board_locked"] and first["move_uci"]
+    assert blurred["board_locked"] and blurred["board_corners"] == corners
+    assert blurred["geometry_held"] and not blurred["position_verified"]
+    assert blurred["move_uci"] is None and blurred["overlay"] is None
+    assert calls[1]["board_corners"] == corners and calls[1]["orientation"] == "auto"
+    assert calls[1]["corners_source"] == "tracked"
+    assert recovered["status"] == "no_change" and recovered["move_uci"] == first["move_uci"]
+    assert not recovered["geometry_held"] and recovered["position_verified"]
+
+
+def test_manual_corners_reach_detector_and_persist_with_session(client, monkeypatch):
+    corners = [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]
+    calls = []
+    def detect(*args, **kwargs):
+        calls.append(kwargs)
+        return {"fen": None, "error": "Read the pieces.", "status": "setup_required", "confidence": .5,
+                "board_detected": True, "board_corners": corners, "pieces_detected": False}
+    monkeypatch.setattr(app.state.detector, "detect", detect)
+    first = client.post("/api/analyze", json={"image_b64": "ZmFrZQ==", "session_id": "manual",
+                        "board_corners": corners, "corners_source": "manual"}).json()
+    assert first["board_locked"] and first["corners_source"] == "manual"
+    client.post("/api/analyze", json={"image_b64": "ZmFrZQ==", "session_id": "manual"})
+    assert calls[1]["board_corners"] == corners and calls[1]["corners_source"] == "manual"
+
+
+@pytest.mark.parametrize("echoed_source", [None, "auto", "manual"])
+def test_long_missing_board_expires_held_geometry(client, monkeypatch, echoed_source):
+    session = analysis._session("expired_geometry")
+    session.board_corners = [[0, 0], [1, 0], [1, 1], [0, 1]]
+    session.geometry_seen = analysis.time.monotonic() - 9
+    session.orientation = "b"
+    session.previous_fen = chess.STARTING_FEN
+    monkeypatch.setattr(app.state.detector, "detect", lambda *a, **kw: {
+        "fen": None, "error": "Board not found.", "status": "detection_error", "board_detected": False})
+    body = {"image_b64": "ZmFrZQ==", "session_id": "expired_geometry"}
+    if echoed_source:
+        body.update(board_corners=session.board_corners, corners_source=echoed_source)
+    data = client.post("/api/analyze", json=body).json()
+    assert not data["board_locked"] and data["lock_state"] == "reacquiring"
+    assert data["board_corners"] is None and data["overlay"] is None
+    assert data["lock_released"] and session.orientation is None
+
+
+def test_unverified_fen_never_reaches_engine_or_trusted_position(client, monkeypatch):
+    monkeypatch.setattr(app.state.detector, "detect", lambda *a, **kw: {
+        "fen": chess.STARTING_FEN, "status": "ok", "position_verified": False,
+        "board_detected": True, "board_corners": [[0, 0], [1, 0], [1, 1], [0, 1]],
+        "orientation": "w", "pieces_detected": True,
+    })
+    monkeypatch.setattr(app.state.stockfish, "get_best_move", lambda *a, **kw: pytest.fail("Unverified position reached engine"))
+    data = client.post("/api/analyze", json={"image_b64": "ZmFrZQ==", "session_id": "unverified"}).json()
+    assert data["status"] == "position_uncertain"
+    assert not data["position_verified"] and data["fen"] is None
+    assert data["move_uci"] is None and data["overlay"] is None
+    assert analysis._sessions["unverified"].previous_fen is None
+
+
+def test_auto_reacquisition_does_not_inherit_rejected_manual_provenance(client, monkeypatch):
+    corners = [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]
+    monkeypatch.setattr(app.state.detector, "detect", lambda *a, **kw: {
+        "fen": None, "status": "position_uncertain", "board_detected": True,
+        "board_corners": corners, "corners_source": "auto", "pieces_detected": True,
+    })
+    result = client.post("/api/analyze", json={"image_b64": "ZmFrZQ==", "session_id": "reacquired",
+                         "board_corners": [[0, 0], [1, 0], [1, 1], [0, 1]], "corners_source": "manual"}).json()
+    assert result["corners_source"] == "auto"
+    assert analysis._sessions["reacquired"].corners_source == "auto"
+
+
+def test_empty_board_cannot_turn_into_a_held_lock_on_the_next_frame(client, monkeypatch):
+    readings = iter([
+        {"fen": None, "status": "setup_required", "board_detected": True,
+         "board_corners": [[0, 0], [1, 0], [1, 1], [0, 1]], "pieces_detected": False},
+        {"fen": None, "status": "detection_error", "board_detected": False},
+    ])
+    monkeypatch.setattr(app.state.detector, "detect", lambda *a, **kw: next(readings))
+    body = {"image_b64": "ZmFrZQ==", "session_id": "empty_then_missing"}
+    assert not client.post("/api/analyze", json=body).json()["board_locked"]
+    missing = client.post("/api/analyze", json=body).json()
+    assert not missing["board_locked"] and not missing["geometry_held"]
+    assert missing["board_corners"] is None

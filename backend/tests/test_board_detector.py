@@ -312,3 +312,83 @@ def test_warm_wooden_piece_tones_and_camera_noise_are_not_hardcoded_black_white(
     else:
         assert result["piece_count"] == 0
         assert result["fen"] is None
+
+
+@pytest.mark.parametrize("sigma", [1.5, 3, 6])
+def test_blurred_opening_retains_exact_occupancy_and_board_alignment(detector, sigma):
+    image = cv2.GaussianBlur(board_image(), (0, 0), sigma)
+    result = detector.detect(encode(image), corners_source="auto", side_to_move="w")
+    assert result["status"] == "ok", result["error"]
+    assert result["fen"] == STARTING_FEN
+    assert result["piece_count"] == 32
+    assert result["position_verified"]
+    assert result["recognition"] == "standard_opening"
+    assert result["quality"]["sharpness"] >= 0
+    assert np.allclose(result["board_corners"], [[0, 0], [1, 0], [1, 1], [0, 1]], atol=.01)
+
+
+def test_shadow_does_not_shift_board_boundary_or_lose_pieces(detector):
+    image = np.clip(board_image().astype(float) * np.linspace(.35, 1, 480)[None, :, None], 0, 255).astype(np.uint8)
+    result = detector.detect(encode(image))
+    assert result["fen"] == STARTING_FEN
+    assert result["piece_count"] == 32
+    assert np.allclose(result["board_corners"], [[0, 0], [1, 0], [1, 1], [0, 1]], atol=.01)
+
+
+def test_low_contrast_board_still_calibrates(detector):
+    image = np.clip(board_image().astype(float) * .24 + 100, 0, 255).astype(np.uint8)
+    result = detector.detect(encode(image))
+    assert result["fen"] == STARTING_FEN
+    assert result["piece_count"] == 32
+
+
+def test_blurred_empty_squares_do_not_become_phantom_pieces(detector):
+    image = cv2.GaussianBlur(board_image(pieces=False), (0, 0), 6)
+    result = detector.detect(encode(image))
+    assert result["board_detected"]
+    assert result["piece_count"] == 0
+    assert result["fen"] is None
+    assert not result["position_verified"]
+
+
+def test_manual_corner_lock_does_not_invent_a_position_on_blank_frame(detector):
+    corners = [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]
+    result = detector.detect(encode(np.full((480, 480, 3), 120, np.uint8)),
+                             board_corners=corners, corners_source="manual", previous_fen=STARTING_FEN)
+    assert result["board_detected"]
+    assert result["corners_source"] == "manual"
+    assert result["fen"] is None
+    assert not result["position_verified"]
+    assert result["status"] == "position_uncertain"
+
+
+def test_turn_selection_applies_only_to_new_calibration(detector):
+    result = detector.detect(encode(board_image()), side_to_move="b")
+    assert result["turn"] == "b"
+    assert not chess.Board(result["fen"]).turn
+    tracked = detector.detect(encode(board_image()), previous_fen=STARTING_FEN, side_to_move="b")
+    assert tracked["fen"] == STARTING_FEN
+    assert tracked["recognition"] == "legal_tracking"
+
+
+def test_tracked_corners_are_distinct_from_manual_and_rejected_without_board_evidence(detector):
+    corners = [[0, 0], [1, 0], [1, 1], [0, 1]]
+    result = detector.detect(encode(board_image()), board_corners=corners, corners_source="tracked")
+    assert result["fen"] == STARTING_FEN
+    assert result["corners_source"] == "tracked"
+    lost = detector.detect(encode(np.full((480, 480, 3), 120, np.uint8)),
+                           board_corners=corners, corners_source="tracked", previous_fen=STARTING_FEN)
+    assert not lost["board_detected"]
+    assert lost["fen"] is None
+
+
+def test_auto_orientation_reacquires_reversed_board_while_tracking(detector):
+    initial = detector.detect(encode(board_image()), orientation="auto")
+    board = chess.Board()
+    board.push_uci("e2e4")
+    reversed_view = detector.detect(encode(board_image(board, rotation=True)), orientation="auto",
+                                    previous_fen=initial["fen"], board_corners=initial["board_corners"],
+                                    corners_source="tracked")
+    assert reversed_view["fen"] == board.fen()
+    assert reversed_view["orientation"] == "b"
+    assert reversed_view["position_verified"]

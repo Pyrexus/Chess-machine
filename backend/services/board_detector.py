@@ -29,7 +29,8 @@ class BoardDetector:
 
     def detect(self, image_bytes: bytes, player_color: str = "w",
                orientation: str = "w", previous_fen: str | None = None,
-               board_corners: list | None = None, setup_fen: str | None = None) -> dict:
+               board_corners: list | None = None, setup_fen: str | None = None,
+               side_to_move: str | None = None, corners_source: str = "auto") -> dict:
         if not self._ready:
             return _err("Detector not initialised.")
         try:
@@ -40,7 +41,7 @@ class BoardDetector:
         h, w = img.shape[:2]
         if min(h, w) < 64:
             return _err("Image is too small to read a chessboard. Use a full-resolution photo.")
-        corners, corner_confidence = None, 0.0
+        corners, corner_confidence, geometry_source = None, 0.0, "auto"
         if board_corners is not None:
             try:
                 supplied = np.asarray(board_corners, dtype=np.float32)
@@ -51,8 +52,9 @@ class BoardDetector:
                             cv2.contourArea(candidate) >= h * w * MIN_BOARD_AREA_FRACTION):
                         candidate = _order_points(candidate)
                         score = self._checker_score(self._warp(img, candidate))
-                        if score >= 0.65:
+                        if score >= 0.60 or corners_source == "manual":
                             corners, corner_confidence = candidate, score
+                            geometry_source = "manual" if corners_source == "manual" else "tracked"
             except (ValueError, cv2.error):
                 pass
         if corners is None:
@@ -69,6 +71,9 @@ class BoardDetector:
             "board_corners": np.clip(corners / np.array([w - 1, h - 1]), 0, 1).round(6).tolist(),
             "orientation": "b" if orientation == "b" else "w",
             "requires_setup": False, "board_b64": _cv2_to_b64(warped),
+            "corners_source": geometry_source,
+            "quality": self._image_quality(warped),
+            "recognition": "occupancy", "position_verified": False,
             "occupancy": matrix,
             "piece_count": sum(cell in ("W", "B") for row in matrix for cell in row),
             "pieces_detected": any(cell in ("W", "B") for row in matrix for cell in row),
@@ -93,7 +98,8 @@ class BoardDetector:
             unique = {(fen, direction) for fen, direction in possibilities}
             if len(unique) == 1:
                 fen, direction = unique.pop()
-                result.update(fen=fen, turn="w" if chess.Board(fen).turn else "b", orientation=direction)
+                result.update(fen=fen, turn="w" if chess.Board(fen).turn else "b", orientation=direction,
+                              recognition="setup" if setup_fen else "legal_tracking", position_verified=True)
                 return result
             if len(unique) > 1:
                 return self._uncertain(result, "position_uncertain",
@@ -108,7 +114,14 @@ class BoardDetector:
         choices = ("w", "b") if orientation == "auto" else (result["orientation"],)
         for direction in choices:
             if _orient(matrix, direction) == starting:
-                result.update(fen=STARTING_FEN, turn="w", orientation=direction)
+                initial = chess.Board()
+                # The side to move is a user choice, never inferred from the
+                # player's colour or from pixels. A known tracked FEN retains
+                # its own turn and chess-rule state above.
+                if side_to_move in ("w", "b"):
+                    initial.turn = side_to_move == "w"
+                result.update(fen=initial.fen(), turn="w" if initial.turn else "b", orientation=direction,
+                              recognition="standard_opening", position_verified=True)
                 return result
         return self._uncertain(result, "setup_required",
                                "Board locked. Start with the standard opening layout, or set this position once to track the game.")
@@ -205,6 +218,27 @@ class BoardDetector:
         if best_score >= 0.78:
             return best, round(best_score, 3)
 
+        # Real pieces break contour boundaries, and a folding board may have
+        # no closed outside contour at all. Intersect long, independently
+        # detected grid/border lines to recover candidate quadrilaterals.
+        line_candidates = self._line_candidates(gray)
+        promising = []
+        small_dst = np.float32([[0, 0], [159, 0], [159, 159], [0, 159]])
+        for candidate in line_candidates:
+            transform = cv2.getPerspectiveTransform(candidate, small_dst)
+            preview = cv2.warpPerspective(img, transform, (160, 160))
+            score = self._checker_score(preview)
+            if score >= .58:
+                promising.append((score, candidate))
+        for _, candidate in sorted(promising, key=lambda item: item[0], reverse=True)[:10]:
+            for inset in (0, .015, .03, .045, .06):
+                test = _inset_corners(candidate, inset)
+                score = self._checker_score(self._warp(img, test))
+                if score > best_score:
+                    best, best_score = test, score
+        if best_score >= .78:
+            return best, round(best_score, 3)
+
         # Internal grid intersections recover an obscured outline. Avoid an
         # exhaustive detector on every phone frame.
         found, points = cv2.findChessboardCorners(
@@ -223,6 +257,63 @@ class BoardDetector:
         return (best, round(best_score, 3)) if best_score >= 0.65 else (None, 0.0)
 
     @staticmethod
+    def _line_candidates(gray: np.ndarray) -> list:
+        h, w = gray.shape
+        detected = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(gray)[0]
+        if detected is None:
+            return []
+        lines = detected[:, 0, :]
+        lengths = np.hypot(lines[:, 2] - lines[:, 0], lines[:, 3] - lines[:, 1])
+        keep = lengths >= min(h, w) * .15
+        lines, lengths = lines[keep], lengths[keep]
+        if len(lines) < 4:
+            return []
+        angles = np.mod(np.arctan2(lines[:, 3] - lines[:, 1], lines[:, 2] - lines[:, 0]), np.pi)
+        hist, edges = np.histogram(angles, bins=36, range=(0, np.pi), weights=lengths)
+        dominant = (edges[int(np.argmax(hist))] + edges[int(np.argmax(hist)) + 1]) / 2
+        distance = lambda a, b: abs((a - b + np.pi / 2) % np.pi - np.pi / 2)
+        groups = []
+        for angle in (dominant, (dominant + np.pi / 2) % np.pi):
+            group = []
+            for index in np.argsort(lengths)[::-1]:
+                if distance(angles[index], angle) > np.deg2rad(22):
+                    continue
+                x1, y1, x2, y2 = lines[index]
+                line = np.cross([x1, y1, 1], [x2, y2, 1])
+                line /= max(1e-6, np.linalg.norm(line[:2]))
+                if line[0] < 0 or abs(line[0]) < 1e-6 and line[1] < 0:
+                    line *= -1
+                if any(abs(np.dot(line - old, [w / 2, h / 2, 1])) < min(h, w) * .012 for old in group):
+                    continue
+                group.append(line)
+                if len(group) >= 9:
+                    break
+            groups.append(group)
+        if min(map(len, groups)) < 2:
+            return []
+        pairs = []
+        for group in groups:
+            pair_group = []
+            for i, first in enumerate(group):
+                for second in group[i + 1:]:
+                    if abs(np.dot(first - second, [w / 2, h / 2, 1])) >= min(h, w) * .22:
+                        pair_group.append((first, second))
+            pairs.append(pair_group)
+        candidates = []
+        for first, second in pairs[0]:
+            for third, fourth in pairs[1]:
+                intersections = [np.cross(a, b) for a, b in
+                                 [(first, third), (first, fourth), (second, fourth), (second, third)]]
+                if any(abs(p[2]) < 1e-6 for p in intersections):
+                    continue
+                points = _order_points(np.float32([p[:2] / p[2] for p in intersections]))
+                if (points[:, 0] < -2).any() or (points[:, 0] > w + 1).any() or (points[:, 1] < -2).any() or (points[:, 1] > h + 1).any():
+                    continue
+                if cv2.isContourConvex(points) and cv2.contourArea(points) >= h * w * MIN_BOARD_AREA_FRACTION:
+                    candidates.append(points)
+        return candidates
+
+    @staticmethod
     def _warp(img: np.ndarray, corners: np.ndarray) -> np.ndarray:
         dst = np.array([[0, 0], [WARP_SIZE - 1, 0], [WARP_SIZE - 1, WARP_SIZE - 1], [0, WARP_SIZE - 1]], np.float32)
         transform = cv2.getPerspectiveTransform(_order_points(corners), dst)
@@ -235,7 +326,10 @@ class BoardDetector:
         patches = []
         # Sample all 64 cells together. This avoids hundreds of Python/median
         # calls for every candidate and keeps camera localisation responsive.
-        for py, px in ((0.14, 0.14), (0.14, 0.86), (0.86, 0.14), (0.86, 0.86)):
+        # Stay clear of square edges: defocus mixes neighbouring colours for
+        # several pixels. Sampling there makes an empty cell's clean centre
+        # look like a foreground piece on a blurred phone frame.
+        for py, px in ((0.18, 0.18), (0.18, 0.82), (0.82, 0.18), (0.82, 0.82)):
             y, x = int(py * size), int(px * size)
             patches.append(np.median(cells[:, :, y - 2:y + 3, x - 2:x + 3], axis=(2, 3)))
         return np.median(np.stack(patches), axis=0).astype(np.float32)
@@ -243,17 +337,46 @@ class BoardDetector:
     def _checker_score(self, board: np.ndarray) -> float:
         colours = self._backgrounds(board)
         parity = np.indices((8, 8)).sum(axis=0) % 2
-        means = [np.median(colours[parity == value], axis=0) for value in (0, 1)]
-        contrast = float(np.linalg.norm(means[0] - means[1]))
-        if contrast < 35:
+        yy, xx = np.indices((8, 8)).astype(np.float32)
+        # A single global light/dark threshold fails when a phone or window
+        # casts a gradient across the board. Fit illumination and checker
+        # contrast together; robust weights suppress piece-covered samples.
+        lighting = np.stack([np.ones(64), xx.ravel() / 7, yy.ravel() / 7], axis=1)
+        # A shadow scales both the mean square colour and its checker
+        # contrast. Fit both effects; a constant contrast alone shifts the
+        # best-scoring boundary inward under uneven illumination.
+        design = np.concatenate([lighting, lighting * (parity.ravel() * 2 - 1)[:, None]], axis=1)
+        samples = colours.reshape(64, 3)
+        weights = np.ones(64)
+        for _ in range(4):
+            root = np.sqrt(weights)[:, None]
+            coeff = np.linalg.lstsq(design * root, samples * root, rcond=None)[0]
+            errors = np.linalg.norm(samples - design @ coeff, axis=1)
+            scale = max(4.0, float(np.median(errors)) * 1.4826)
+            weights = np.minimum(1.0, 2.5 * scale / np.maximum(errors, 1e-3))
+        checker = lighting @ coeff[3:]
+        contrast = float(np.median(np.linalg.norm(checker, axis=1)) * 2)
+        if contrast < 18:
             return 0.0
-        distances = np.stack([np.linalg.norm(colours - mean, axis=2) for mean in means], axis=2)
-        agreement = float(np.mean(np.argmin(distances, axis=2) == parity))
-        # Rectangles, stripes, and partially cropped grids must not lock.
-        if agreement < 0.88:
+        illumination = lighting @ coeff[:3]
+        distances = np.stack([np.linalg.norm(samples - illumination + checker, axis=1),
+                              np.linalg.norm(samples - illumination - checker, axis=1)], axis=1)
+        matching = (np.argmin(distances, axis=1) == parity.ravel()).reshape(8, 8)
+        agreement = float(np.mean(matching))
+        # Require checker evidence across both axes, not just one patch of
+        # floor tiles, a rectangle, or screen stripes.
+        if agreement < .80 or np.mean(matching.mean(axis=0) >= .625) < .75 or np.mean(matching.mean(axis=1) >= .625) < .75:
             return 0.0
-        residual = float(np.median(np.min(distances, axis=2))) / contrast
+        residual = float(np.median(np.min(distances, axis=1))) / contrast
         return float(np.clip(agreement * (1 - min(residual, 0.35)), 0, 1))
+
+    @staticmethod
+    def _image_quality(board: np.ndarray) -> dict:
+        gray = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+        contrast = float(np.percentile(gray, 95) - np.percentile(gray, 5))
+        return {"sharpness": round(sharpness, 1), "contrast": round(contrast, 1),
+                "blurred": sharpness < 22, "low_contrast": contrast < 35}
 
     def _classify_squares(self, board: np.ndarray):
         size = board.shape[0] // 8
@@ -276,14 +399,26 @@ class BoardDetector:
                     y, x = int(py * size), int(px * size)
                     patch = cell[y - 2:y + 3, x - 2:x + 3]
                     corner_noise.extend(np.linalg.norm(patch - background_lab[row, col], axis=2).ravel())
-                threshold = max(14.0, float(np.percentile(corner_noise, 90)) * 1.75 + 3)
+                threshold = max(8.0, float(np.percentile(corner_noise, 90)) * 1.5 + 2)
                 mask = (distance > threshold).astype(np.uint8)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-                count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+                count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
                 if count <= 1:
                     entries.append(("empty", None, 0.98))
                     continue
-                index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                # Defocus spreads alternating square edges into the cell.
+                # Those edge strips must not become phantom pieces. A piece
+                # footprint has substantial evidence near the cell centre.
+                mh, mw = mask.shape
+                central = labels[int(mh * .3):int(mh * .7), int(mw * .3):int(mw * .7)]
+                candidates = [i for i in range(1, count)
+                              if .18 * mw <= centroids[i, 0] <= .82 * mw
+                              and .18 * mh <= centroids[i, 1] <= .82 * mh
+                              and np.mean(central == i) > .06]
+                if not candidates:
+                    entries.append(("empty", None, 0.9))
+                    continue
+                index = max(candidates, key=lambda i: stats[i, cv2.CC_STAT_AREA])
                 fraction = int(stats[index, cv2.CC_STAT_AREA]) / interior.shape[0] / interior.shape[1]
                 if fraction < 0.035:
                     entries.append(("empty", None, 0.9))
@@ -341,7 +476,9 @@ class BoardDetector:
 def _err(message: str, confidence: float = 0.0) -> dict:
     return {"fen": None, "turn": None, "confidence": confidence, "error": message,
             "status": "detection_error", "board_detected": False, "board_corners": None,
-            "requires_setup": False, "board_b64": None, "piece_count": 0, "pieces_detected": False}
+            "requires_setup": False, "board_b64": None, "piece_count": 0, "pieces_detected": False,
+            "quality": None, "recognition": "unreadable", "position_verified": False,
+            "corners_source": "auto"}
 
 
 def _occupancy(board: chess.Board) -> list:
