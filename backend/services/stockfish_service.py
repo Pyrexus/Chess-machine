@@ -277,14 +277,19 @@ class StockfishService:
 
     def _spawn(self):
         try:
-            self._engine = chess.engine.SimpleEngine.popen_uci(self._path, timeout=3.0)
+            # Cold containers can take several seconds to load Stockfish's
+            # embedded neural network. Keep that startup allowance separate
+            # from the timeout used for ordinary move requests.
+            self._engine = chess.engine.SimpleEngine.popen_uci(self._path, timeout=15.0)
             self._engine.configure({"Threads": 1, "Hash": 32})
+            self._engine.ping()
+            self._engine.timeout = 3.0
             logger.info("Stockfish engine process spawned successfully.")
         except Exception as e:
             if self._engine:
                 self._engine.close()
             self._engine = None
-            logger.error(f"Stockfish spawn failed: {e}")
+            logger.error("Stockfish spawn failed (%s): %r", type(e).__name__, e)
             raise
 
     def stop(self):
